@@ -1722,7 +1722,7 @@ void shimWebAssemblyInstantiate(jsg::Lock& lock, v8::Local<v8::Context> context)
 void Worker::setupContext(
     jsg::Lock& lock, v8::Local<v8::Context> context, const LoggingOptions& loggingOptions) {
   // Set WebAssembly.Module @@HasInstance
-  setWebAssemblyModuleHasInstance(lock, context);
+  //setWebAssemblyModuleHasInstance(lock, context);  SnapshotCreator's isolate doesn't have access to WebAssembly
 
   // Shim WebAssembly.instantiate to detect modules exporting "__instance_signal".
   if (util::Autogate::isEnabled(util::AutogateKey::WASM_SHUTDOWN_SIGNAL_SHIM)) {
@@ -2040,6 +2040,20 @@ Worker::Worker(kj::Own<const Script> scriptParam,
       // Ref: https://github.com/cloudflare/workerd/issues/5332
       if (script->isolate->impl->inspector == kj::none) {
         lock.v8Isolate->SetCaptureStackTraceForUncaughtExceptions(false);
+      }
+
+      // Create a V8 snapshot blob after stage 2
+      auto maybeexp = kj::runCatchingExceptions([&]() {
+        jsg::Lock& js = lock;
+        auto& isolateBase = jsg::IsolateBase::from(js.v8Isolate);
+        isolateBase.getSnapshotCreator()->SetDefaultContext(context);
+        auto blob = isolateBase.getSnapshotCreator()->CreateBlob(
+            v8::SnapshotCreator::FunctionCodeHandling::kClear);
+        KJ_DBG("Created snapshot blob!", blob.raw_size, blob.data);
+      });
+
+      KJ_IF_SOME(exp, maybeexp) {
+        KJ_DBG(exp);
       }
     });
   });
