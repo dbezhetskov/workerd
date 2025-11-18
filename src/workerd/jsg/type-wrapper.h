@@ -460,6 +460,12 @@ class TypeWrapper: public DynamicResourceTypeMap<Self>,
     (TypeWrapperBase<Self, T>::initTypeWrapper(), ...);
   }
 
+  // PoC: Collect external references for all registered types BEFORE isolate creation.
+  static void collectAllExternalReferencesPoC() {
+        "========== PoC: Collecting external references for ALL types (no isolate needed!) ==========");
+        (ResourceWrapper<Self, T>::collectExternalReferencesPoC(), ...);
+  }
+
   void visitHandles(
       kj::FunctionParam<void(v8::Global<v8::FunctionTemplate>&)> visitorFunctionTemplate,
       kj::FunctionParam<void(v8::Global<v8::Name>&)> visitName,

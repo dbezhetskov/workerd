@@ -613,6 +613,7 @@ class Isolate: public IsolateBase {
             kj::mv(observer),
             kj::mv(externalStringAllocator),
             group) {
+    // TypeWrapper::collectAllExternalReferencesPoC()
     wrappers.resize(1);
     if (instantiateTypeWrapper) {
       instantiateDefaultWrapper(kj::fwd<MetaConfiguration>(configuration));
@@ -632,6 +633,7 @@ class Isolate: public IsolateBase {
             kj::mv(observer),
             defaultExternalStringAllocator(),
             v8::IsolateGroup::Create()) {
+    // TypeWrapper::collectAllExternalReferencesPoC()
     wrappers.resize(1);
     if (instantiateTypeWrapper) {
       instantiateDefaultWrapper(kj::fwd<MetaConfiguration>(configuration));
