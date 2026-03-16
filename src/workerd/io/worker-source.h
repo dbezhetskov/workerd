@@ -127,6 +127,9 @@ struct WorkerSource {
     // The worker may have a bundle of capnp schemas attached. (In Service Workers syntax, these
     // can't be referenced directly by the app, but they may be used by bindings.)
     capnp::List<capnp::schema::Node>::Reader capnpSchemas;
+
+    // Optional V8 startup snapshot blob. Same semantics as ModulesSource::snapshotBlob.
+    kj::Maybe<kj::ArrayPtr<const kj::byte>> snapshotBlob;
   };
 
   // Representation of source code for a worker using ES Modules syntax.
@@ -146,6 +149,11 @@ struct WorkerSource {
     // Optional Python memory snapshot. The actual capnp type is declared in the internal codebase,
     // so we use AnyStruct here. This is deprecated anyway.
     kj::Maybe<capnp::AnyStruct::Reader> pythonMemorySnapshot;
+
+    // Optional V8 startup snapshot blob. When present, the V8 isolate will be initialized from
+    // this snapshot, providing a pre-built V8 heap snapshot. Pointer is valid as long as the
+    // original capnp message is alive.
+    kj::Maybe<kj::ArrayPtr<const kj::byte>> snapshotBlob;
   };
 
   // The overall value is either ScriptSource or ModulesSource.

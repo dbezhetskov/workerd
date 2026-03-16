@@ -397,6 +397,10 @@ Worker::Script::Source WorkerdApi::extractSource(kj::StringPtr name,
       Worker::Script::ModulesSource result{
         .mainModule = modules[0].getName(), .modules = kj::mv(moduleArray), .isPython = isPython};
 
+      if (conf.hasSnapshotBlob()) {
+        result.snapshotBlob = conf.getSnapshotBlob().asBytes();
+      }
+
       return result;
     }
     case config::Worker::SERVICE_WORKER_SCRIPT: {
@@ -413,11 +417,15 @@ Worker::Script::Source WorkerdApi::extractSource(kj::StringPtr name,
         }
       }
 
-      return Worker::Script::ScriptSource{
+      Worker::Script::ScriptSource result{
         .mainScript = conf.getServiceWorkerScript(),
         .mainScriptName = name,
         .globals = globals.finish(),
       };
+      if (conf.hasSnapshotBlob()) {
+        result.snapshotBlob = conf.getSnapshotBlob().asBytes();
+      }
+      return result;
     }
     case config::Worker::INHERIT:
       // TODO(beta): Support inherit.

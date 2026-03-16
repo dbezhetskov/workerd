@@ -730,6 +730,16 @@ struct Worker {
     # Only used for local development and testing purposes.
   }
 
+  snapshotBlob @18 :Data;
+  # Optional pre-computed V8 startup snapshot blob. When provided, the V8 isolate for this
+  # worker will be initialized from this snapshot, skipping JavaScript compilation on cold start.
+  #
+  # Generate with: workerd snapshot <config-file> <worker-name> -o snapshot.bin
+  # Use with Cap'n Proto's embed directive: snapshotBlob = embed "snapshot.bin"
+  #
+  # NOTE: Snapshot blobs are tied to a specific version of workerd/V8. They must be
+  # regenerated after updating workerd.
+
   struct DockerConfiguration {
     socketPath @0 :Text;
     # Path to the Docker socket.

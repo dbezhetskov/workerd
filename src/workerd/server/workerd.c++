@@ -3,6 +3,7 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 #include "server.h"
+#include "snapshot.h"
 #include "workerd-api.h"
 
 #include <workerd/api/unsafe.h>
@@ -754,6 +755,8 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
           .addSubCommand("make-pyodide-baseline-snapshot",
               KJ_BIND_METHOD(*this, getMakePyodideBaselineSnapshot),
               "Make a Pyodide baseline memory snapshot")
+          .addSubCommand("snapshot", KJ_BIND_METHOD(*this, getSnapshot),
+              "create a V8 startup snapshot from a worker")
           .build();
       // TODO(someday):
       // "validate": Loads the config and parses all the code to report errors, but then exits
@@ -994,6 +997,119 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
         .expectArg("<output-directory>", CLI_METHOD(setPackageDiskCacheDir))
         .callAfterParsing(CLI_METHOD(test))
         .build();
+  }
+
+  kj::MainFunc getSnapshot() {
+    auto builder =
+        kj::MainBuilder(context, getVersionString(), "Creates a V8 startup snapshot from a worker.",
+            "Compiles and evaluates all ES modules of <worker-name> from <config-file> in a plain "
+            "V8 context (no workerd API bindings), then writes the resulting startup snapshot blob "
+            "to the file specified by --output. The snapshot provides pre-compiled module bytecode "
+            "that allows workerd to skip JS compilation on cold start.\n"
+            "\n"
+            "NOTE: Top-level code in the worker cannot use workerd-specific APIs (fetch, Request, "
+            "etc.) during snapshotting -- only standard JavaScript is available. The snapshot blob "
+            "is tied to a specific workerd/V8 version and must be regenerated after updates.\n"
+            "\n"
+            "Reference the generated blob in your config with:\n"
+            "    snapshotBlob = embed \"<output-path>\"");
+    return addConfigParsingOptionsNoConstName(builder)
+        .expectArg("<worker-name>", CLI_METHOD(setSnapshotWorkerName))
+        .addOptionWithArg({'o', "output"}, CLI_METHOD(setSnapshotOutput), "<path>",
+            "Output file path for the snapshot binary. Required.")
+        .callAfterParsing(CLI_METHOD(runCreateSnapshot))
+        .build();
+  }
+
+  void setSnapshotWorkerName(kj::StringPtr name) {
+    snapshotWorkerName = kj::str(name);
+  }
+
+  void setSnapshotOutput(kj::StringPtr path) {
+    snapshotOutputPath = kj::str(path);
+  }
+
+  void runCreateSnapshot() {
+    if (hadErrors) {
+      context.exit();
+    }
+
+    kj::StringPtr workerName =
+        KJ_ASSERT_NONNULL(snapshotWorkerName, "Worker name argument is required");
+    kj::StringPtr outputPath = KJ_UNWRAP_OR(snapshotOutputPath, {
+      context.exitError("Output path (--output / -o) is required for the snapshot command.");
+    });
+
+    auto confReader = getConfig();
+
+    // Find the named service and verify it's a worker.
+    kj::Maybe<config::Worker::Reader> maybeWorkerConf;
+    for (auto service: confReader.getServices()) {
+      if (service.getName() == workerName && service.isWorker()) {
+        maybeWorkerConf = service.getWorker();
+        break;
+      }
+    }
+    auto workerConf = KJ_UNWRAP_OR(maybeWorkerConf, {
+      context.exitError(kj::str("No worker service named '", workerName,
+          "' found in config. Make sure the service exists and is of type 'worker'."));
+    });
+
+    // Compile compatibility flags.
+    capnp::MallocMessageBuilder arena;
+    auto featureFlags = arena.initRoot<CompatibilityFlags>();
+
+    // Simple error reporter that accumulates errors and exits at the end.
+    struct SnapshotErrorReporter: public Worker::ValidationErrorReporter {
+      kj::Vector<kj::String> errors;
+      void addError(kj::String error) override {
+        errors.add(kj::mv(error));
+      }
+      void addEntrypoint(kj::Maybe<kj::StringPtr>, kj::Array<kj::String>) override {}
+      void addActorClass(kj::StringPtr) override {}
+      void addWorkflowClass(kj::StringPtr, kj::Array<kj::String>) override {}
+    };
+    SnapshotErrorReporter errorReporter;
+
+    // Extract the worker source from config.
+    auto workerSource =
+        WorkerdApi::extractSource(workerName, workerConf, featureFlags.asReader(), errorReporter);
+
+    if (!errorReporter.errors.empty()) {
+      for (auto& err: errorReporter.errors) {
+        context.error(err);
+      }
+      context.exit();
+    }
+
+    // Initialize V8 once, then dispatch to the appropriate snapshot overload.
+    auto platform = jsg::defaultPlatform(0);
+    WorkerdPlatform v8Platform(*platform);
+    jsg::V8System v8System(v8Platform,
+        KJ_MAP(flag, confReader.getV8Flags()) -> kj::StringPtr { return flag; }, platform.get());
+
+    kj::Array<kj::byte> snapshotBlob;
+    KJ_SWITCH_ONEOF(workerSource.variant) {
+      KJ_CASE_ONEOF(source, WorkerSource::ModulesSource) {
+        snapshotBlob = createWorkerSnapshot(v8System, source);
+      }
+      KJ_CASE_ONEOF(source, WorkerSource::ScriptSource) {
+        snapshotBlob = createWorkerSnapshot(v8System, source);
+      }
+    }
+
+    // Write the blob to the output file.
+    auto destPath = fs->getCurrentPath().evalNative(outputPath);
+    auto& dir = fs->getRoot();
+    {
+      auto outFile = dir.openFile(
+          destPath, kj::WriteMode::CREATE | kj::WriteMode::MODIFY | kj::WriteMode::CREATE_PARENT);
+      outFile->write(0, snapshotBlob.asBytes());
+      outFile->truncate(snapshotBlob.size());
+    }
+
+    KJ_LOG(INFO, "Snapshot written", outputPath, snapshotBlob.size());
+    context.exit();
   }
 
   void addImportPath(kj::StringPtr pathStr) {
@@ -1573,6 +1689,9 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
 
   kj::Maybe<kj::String> testServicePattern;
   kj::Maybe<kj::String> testEntrypointPattern;
+
+  kj::Maybe<kj::String> snapshotWorkerName;
+  kj::Maybe<kj::String> snapshotOutputPath;
 
 #ifdef WORKERD_USE_PERFETTO
   kj::Maybe<kj::String> perfettoTraceDestination;

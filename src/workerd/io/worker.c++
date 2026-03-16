@@ -34,6 +34,7 @@
 #include <rust/jsg/ffi.h>
 #include <v8-inspector.h>
 #include <v8-profiler.h>
+#include <v8.h>
 
 #include <capnp/compat/json.h>
 #include <capnp/message.h>
@@ -1712,6 +1713,97 @@ kj::Maybe<jsg::JsObject> tryResolveMainModule(jsg::Lock& js,
 }
 }  // anonymous namespace
 
+// Attempts to replay event listener registrations stored in a ScriptSource snapshot.
+//
+// When createWorkerSnapshot(ScriptSource) is called, it executes the top-level script in a
+// plain V8 context with a mock `addEventListener` that captures {type, handler} pairs into
+// `globalThis.__snapshot_listeners__`. The context is then saved at index 0 via
+// SnapshotCreator::AddContext().
+//
+// At Worker init time (this function), we restore context index 0 via
+// Context::FromSnapshot(isolate, 0) and call the real JSG `addEventListener` for each
+// recorded entry.  If successful, the caller should skip `unboundScript.run()` since the
+// top-level script was already executed during snapshot creation.
+//
+// Returns true if listeners were replayed (skip unboundScript.run()); false otherwise.
+static bool replaySnapshotListeners(jsg::Lock& lock, v8::Local<v8::Context> jsgCtx) {
+  auto* isolate = lock.v8Isolate;
+
+  // Context index 0 from AddContext is the script execution context created by
+  // createWorkerSnapshot(ScriptSource). An empty MaybeLocal means no such context exists
+  // in the snapshot (old-style clean-heap snapshot, ModulesSource snapshot, or no snapshot).
+  v8::MaybeLocal<v8::Context> maybeSnapCtx = v8::Context::FromSnapshot(isolate, 0);
+  if (maybeSnapCtx.IsEmpty()) {
+    return false;
+  }
+  auto snapCtx = maybeSnapCtx.ToLocalChecked();
+
+  // Match security tokens so that V8 allows cross-context property access between the
+  // snapshot context and the JSG context.  Without this, prototype-chain lookups that
+  // cross context boundaries throw "no access".
+  snapCtx->SetSecurityToken(jsgCtx->GetSecurityToken());
+
+  // Insert the JSG global object into the snapshot context's global prototype chain so that
+  // handler functions compiled in the plain V8 snapshot context can resolve workerd globals
+  // (Response, fetch, URL, etc.) via prototype lookup at call time.
+  //
+  // The snapshot context's global proxy wraps a plain V8 global object.  Setting its
+  // prototype to the JSG global proxy causes missing-property lookups to fall through to the
+  // JSG context's global, which has all workerd API bindings.
+  {
+    v8::Context::Scope snapScope(snapCtx);
+    auto snapGlobal = snapCtx->Global();
+    auto jsgGlobal = jsgCtx->Global();
+    // Ignore failure — handlers may throw ReferenceError for workerd globals, but that is
+    // better than crashing during setup.
+    snapGlobal->SetPrototypeV2(snapCtx, jsgGlobal).IsJust();
+  }
+
+  auto listenersKey = jsg::v8StrIntern(isolate, "__snapshot_listeners__"_kj);
+  auto typeKey = jsg::v8StrIntern(isolate, "type"_kj);
+  auto handlerKey = jsg::v8StrIntern(isolate, "handler"_kj);
+  auto addELKey = jsg::v8StrIntern(isolate, "addEventListener"_kj);
+
+  // Read __snapshot_listeners__ from the snapshot context's global.
+  v8::Local<v8::Value> listenersVal;
+  if (!snapCtx->Global()->Get(snapCtx, listenersKey).ToLocal(&listenersVal) ||
+      listenersVal->IsUndefined() || !listenersVal->IsArray()) {
+    // No listeners array — not a ScriptSource snapshot we recognise.
+    return false;
+  }
+  auto listeners = listenersVal.As<v8::Array>();
+
+  // Get the real JSG addEventListener from the JSG context.
+  v8::Local<v8::Value> addELVal;
+  if (!jsgCtx->Global()->Get(jsgCtx, addELKey).ToLocal(&addELVal) || !addELVal->IsFunction()) {
+    return false;
+  }
+  auto addEL = addELVal.As<v8::Function>();
+
+  // Replay each recorded {type, handler} entry.
+  for (uint32_t i = 0; i < listeners->Length(); ++i) {
+    v8::Local<v8::Value> entry;
+    if (!listeners->Get(snapCtx, i).ToLocal(&entry) || !entry->IsObject()) continue;
+    auto obj = entry.As<v8::Object>();
+
+    v8::Local<v8::Value> type, handler;
+    if (!obj->Get(snapCtx, typeKey).ToLocal(&type)) continue;
+    if (!obj->Get(snapCtx, handlerKey).ToLocal(&handler)) continue;
+    if (!type->IsString() || (!handler->IsFunction() && !handler->IsObject())) continue;
+
+    v8::Local<v8::Value> args[] = {type, handler};
+    // Call the real workerd addEventListener in the JSG context.
+    if (addEL->Call(jsgCtx, jsgCtx->Global(), 2, args).IsEmpty()) {
+      // A JS exception was thrown; the outer TryCatch will capture it.
+      break;
+    }
+  }
+
+  // Return true regardless of listener count — any __snapshot_listeners__ array indicates
+  // the script was already executed during snapshot creation.
+  return true;
+}
+
 Worker::Worker(kj::Own<const Script> scriptParam,
     kj::Own<WorkerObserver> metricsParam,
     kj::FunctionParam<void(jsg::Lock& lock,
@@ -1828,6 +1920,20 @@ Worker::Worker(kj::Own<const Script> scriptParam,
 
             compileBindings(lock, script->isolate->getApi(), bindingsScope, ctxExports);
 
+            // For ScriptSource workers: check whether the isolate was initialised from a
+            // snapshot that already contains the top-level script's execution state.  If so,
+            // replay the stored addEventListener registrations and skip re-running the script.
+            bool hasSnapshotListeners = false;
+            if (!script->isModular()) {
+              auto& monoClock = kj::systemPreciseMonotonicClock();
+              auto t0Replay = monoClock.now();
+              hasSnapshotListeners = replaySnapshotListeners(lock, context);
+              if (hasSnapshotListeners) {
+                KJ_LOG(WARNING, "worker startup: snapshot listener replay", "replay_ms",
+                    (monoClock.now() - t0Replay) / kj::MILLISECONDS);
+              }
+            }
+
             // Execute script.
             currentSpan = maybeMakeSpan("lw:top_level_execution"_kjc);
 
@@ -1850,16 +1956,25 @@ Worker::Worker(kj::Own<const Script> scriptParam,
 
             KJ_SWITCH_ONEOF(script->impl->unboundScriptOrMainModule) {
               KJ_CASE_ONEOF(unboundScript, jsg::NonModuleScript) {
-                auto limitScope =
-                    script->isolate->getLimitEnforcer().enterStartupJs(lock, limitErrorOrTime);
-                unboundScript.run(lock);
-                // Flush microtasks enqueued during top-level script evaluation.
-                // Without this flush, microtasks (e.g. promise continuations from async
-                // initialization) remain on the per-isolate microtask queue and can leak across
-                // V8 contexts when multiple Workers share an isolate (same script, different
-                // zones). The leaked microtasks then execute under the wrong IoContext, making
-                // things go boom.
-                lock.runMicrotasks();
+                if (!hasSnapshotListeners) {
+                  // Normal path: execute top-level script which calls addEventListener() etc.
+                  auto limitScope =
+                      script->isolate->getLimitEnforcer().enterStartupJs(lock, limitErrorOrTime);
+                  auto& monoClock = kj::systemPreciseMonotonicClock();
+                  auto t0Script = monoClock.now();
+                  unboundScript.run(lock);
+                  // Flush microtasks enqueued during top-level script evaluation.
+                  // Without this flush, microtasks (e.g. promise continuations from async
+                  // initialization) remain on the per-isolate microtask queue and can leak across
+                  // V8 contexts when multiple Workers share an isolate (same script, different
+                  // zones). The leaked microtasks then execute under the wrong IoContext, making
+                  // things go boom.
+                  lock.runMicrotasks();
+                  KJ_LOG(WARNING, "worker startup: top-level script execution (no snapshot)",
+                      "script_ms", (monoClock.now() - t0Script) / kj::MILLISECONDS);
+                }
+                // else: snapshot path — listeners were already replayed by replaySnapshotListeners();
+                // top-level execution was performed during snapshot creation.
               }
               KJ_CASE_ONEOF(mainModule, kj::Path) {
                 KJ_IF_SOME(ns,

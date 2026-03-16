@@ -70,6 +70,7 @@ wd_cc_binary(
         ":cpp-capnp-schema",
         ":json-logger",
         ":server",
+        ":snapshot",
         ":v8-platform-impl",
         ":workerd-capnp-schema",
         ":workerd_capnp",
@@ -304,6 +305,18 @@ wd_cc_library(
         "@capnp-cpp//src/kj",
         "@capnp-cpp//src/kj:kj-async",
         "@capnp-cpp//src/kj/compat:kj-http",
+    ],
+)
+
+wd_cc_library(
+    name = "snapshot",
+    srcs = ["snapshot.c++"],
+    hdrs = ["snapshot.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/workerd/io",
+        "//src/workerd/jsg",
+        "@capnp-cpp//src/kj",
     ],
 )
 

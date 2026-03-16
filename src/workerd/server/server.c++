@@ -4411,9 +4411,24 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
         bundleBase, extensions, kj::mv(maybeFallbackService), kj::mv(artifactBundler));
   }
 
+  kj::Maybe<kj::ArrayPtr<const kj::byte>> blobMaybe;
+  KJ_IF_SOME(modulesSource, def.source.variant.tryGet<WorkerSource::ModulesSource>()) {
+    blobMaybe = modulesSource.snapshotBlob;
+  } else KJ_IF_SOME(scriptSource, def.source.variant.tryGet<WorkerSource::ScriptSource>()) {
+    blobMaybe = scriptSource.snapshotBlob;
+  }
+
+  auto createParams = limitEnforcer->getCreateParams();
+  kj::Maybe<v8::StartupData> snapshotStartupData;
+  KJ_IF_SOME(blob, blobMaybe) {
+    snapshotStartupData =
+        v8::StartupData{reinterpret_cast<const char*>(blob.begin()), static_cast<int>(blob.size())};
+    createParams.snapshot_blob = &KJ_ASSERT_NONNULL(snapshotStartupData);
+  }
+
   auto isolateGroup = v8::IsolateGroup::GetDefault();
   auto api = kj::heap<WorkerdApi>(globalContext->v8System, def.featureFlags, extensions,
-      limitEnforcer->getCreateParams(), isolateGroup, kj::mv(jsgobserver), *memoryCacheProvider,
+      kj::mv(createParams), kj::mv(isolateGroup), kj::mv(jsgobserver), *memoryCacheProvider,
       pythonConfig);
 
   auto inspectorPolicy = Worker::Isolate::InspectorPolicy::DISALLOW;
