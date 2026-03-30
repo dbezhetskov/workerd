@@ -15,7 +15,6 @@
     "--background-index",
     "--header-insertion=never",
     "--compile-commands-dir=${workspaceFolder}/",
-    "--query-driver=**",
     "--clang-tidy"
   ],
   "clang-format.executable": "./bazel-bin/build/deps/formatters/clang-format",

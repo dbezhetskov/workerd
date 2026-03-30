@@ -37,6 +37,37 @@
       "externalConsole": false
     },
     {
+      "name": "workerd (dbg, lldb)",
+      "preLaunchTask": "Bazel build workerd (dbg)",
+      "request": "launch",
+      "type": "lldb",
+      "cwd": "${workspaceFolder}",
+      "program": "${workspaceFolder}/bazel-bin/src/workerd/server/workerd",
+      "sourceMap": {
+        "src": "${workspaceFolder}/src",
+        "bazel-bin": "${workspaceFolder}/bazel-bin",
+        "bazel-out": "${workspaceFolder}/bazel-out",
+        "external": "${workspaceFolder}/external",
+        "/proc/self/cwd": "${workspaceFolder}",
+      },
+      "args": ["serve", "${input:workerdConfig}"]
+    },
+    {
+      "name": "workerd snapshot (dbg, lldb)",
+      "preLaunchTask": "Bazel build workerd (dbg)",
+      "request": "launch",
+      "type": "lldb",
+      "cwd": "${workspaceFolder}",
+      "program": "${workspaceFolder}/bazel-bin/src/workerd/server/workerd",
+      "sourceMap": {
+        "src": "${workspaceFolder}/src",
+        "bazel-bin": "${workspaceFolder}/bazel-bin",
+        "bazel-out": "${workspaceFolder}/bazel-out",
+        "external": "${workspaceFolder}/external"
+      },
+      "args": ["snapshot", "${input:workerdConfig}", "main", "-o", "hw_snapshot.bin"]
+    },
+    {
       "name": "workerd (opt)",
       "preLaunchTask": "Bazel build workerd (opt)",
       "request": "launch",
