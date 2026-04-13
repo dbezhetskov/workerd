@@ -2046,6 +2046,11 @@ class ResourceWrapper {
 
   kj::Maybe<v8::NamedPropertyHandlerConfiguration> wildcardHandler;
 
+  void visitConstructorHandles(kj::FunctionParam<void(v8::Global<v8::FunctionTemplate>&)> visitor) {
+    if (!memoizedConstructor.IsEmpty()) visitor(memoizedConstructor);
+    if (!contextConstructor.IsEmpty()) visitor(contextConstructor);
+  }
+
  private:
   Configuration configuration;
   v8::Global<v8::FunctionTemplate> memoizedConstructor;

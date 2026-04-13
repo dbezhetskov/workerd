@@ -253,6 +253,17 @@ class Function<Ret(Args...)> {
     }
   }
 
+  // Visit underlying v8::Global handles for V8 snapshot creation. Only meaningful for JS-backed
+  // functions; native-backed functions hold no V8 handles directly. Also resets tracedHandle on
+  // each Data (via visitHandle) so V8 doesn't see dangling TracedReferences at CreateBlob time.
+  template <typename Fn>
+  inline void visitHandlesForSnapshot(Fn&& fn) {
+    KJ_IF_SOME(js, impl.template tryGet<JsImpl>()) {
+      js.receiver.visitHandle(fn);
+      js.handle.visitHandle(fn);
+    }
+  }
+
   JSG_MEMORY_INFO(Function) {
     KJ_SWITCH_ONEOF(impl) {
       KJ_CASE_ONEOF(ref, Ref<NativeFunction>) {

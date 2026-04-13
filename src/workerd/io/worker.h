@@ -27,6 +27,8 @@
 #include <kj/compat/http.h>
 #include <kj/mutex.h>
 
+#include <memory>
+
 namespace v8 {
 class BackingStore;
 class Isolate;
@@ -211,8 +213,10 @@ class Worker: public kj::AtomicRefcounted {
   kj::Promise<AsyncLock> takeAsyncLockWhenActorCacheReady(
       kj::Date now, Actor& actor, RequestObserver& request) const;
 
-  static void setupContext(
-      jsg::Lock& lock, v8::Local<v8::Context> context, const LoggingOptions& loggingOptions);
+  static void setupContext(jsg::Lock& lock,
+      v8::Local<v8::Context> context,
+      const LoggingOptions& loggingOptions,
+      kj::Vector<std::shared_ptr<v8::Global<v8::Function>>>* outConsoleOriginals = nullptr);
 
  private:
   kj::Own<const Script> script;

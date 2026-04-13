@@ -339,6 +339,18 @@ class IsolateBase {
     return snapshotCreator.get();
   }
 
+  // Visits all persistent handles owned by this isolate and its type wrappers.
+  // Subclasses (Isolate<TypeWrapper>) override to also visit per-type handles.
+  virtual void visitPersistentHandles(
+      kj::FunctionParam<void(v8::Global<v8::FunctionTemplate>&)> visitFT,
+      kj::FunctionParam<void(v8::Global<v8::Object>&)> visitObj,
+      kj::FunctionParam<void(v8::Global<v8::Name>&)> visitName,
+      kj::FunctionParam<void(v8::Global<v8::DictionaryTemplate>&)> visitDictTmpl) {
+    if (!opaqueTemplate.IsEmpty()) visitFT(opaqueTemplate);
+    if (!workerEnvObj.IsEmpty()) visitObj(workerEnvObj);
+    if (!workerExportsObj.IsEmpty()) visitObj(workerExportsObj);
+  }
+
  private:
   template <typename TypeWrapper>
   friend class Isolate;
@@ -647,6 +659,18 @@ class Isolate: public IsolateBase {
 
   ~Isolate() noexcept(false) {
     dropWrappers([this]() { wrappers.clear(); });
+  }
+
+  void visitPersistentHandles(kj::FunctionParam<void(v8::Global<v8::FunctionTemplate>&)> visitFT,
+      kj::FunctionParam<void(v8::Global<v8::Object>&)> visitObj,
+      kj::FunctionParam<void(v8::Global<v8::Name>&)> visitName,
+      kj::FunctionParam<void(v8::Global<v8::DictionaryTemplate>&)> visitDictTmpl) override {
+    IsolateBase::visitPersistentHandles(visitFT, visitObj, visitName, visitDictTmpl);
+    if (!hasExtraWrappers) {
+      wrappers[0]->visitHandles(visitFT, visitName, visitDictTmpl);
+    } else {
+      KJ_FAIL_ASSERT("Not yet implemented");
+    }
   }
 
   kj::Exception unwrapException(

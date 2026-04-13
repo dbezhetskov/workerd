@@ -537,6 +537,10 @@ struct Worker::Impl {
 
   // If set, then any attempt to use this worker shall throw this exception.
   kj::Maybe<kj::Exception> permanentException;
+
+  // Shared handles to original console functions, populated by setupContext.
+  // Stored via shared_ptr so the same Global can be Reset from outside the lambda closure.
+  kj::Vector<std::shared_ptr<v8::Global<v8::Function>>> consoleOriginals;
 };
 
 // Note that Isolate mutable state is protected by locking the JsgWorkerIsolate unless otherwise
@@ -644,13 +648,14 @@ struct Worker::Isolate::Impl {
     }
     KJ_DISALLOW_COPY_AND_MOVE(Lock);
 
-    void setupContext(v8::Local<v8::Context> context) {
+    void setupContext(v8::Local<v8::Context> context,
+        kj::Vector<std::shared_ptr<v8::Global<v8::Function>>>* outConsoleOriginals = nullptr) {
       // The V8Inspector implements the `console` object.
       KJ_IF_SOME(i, impl.inspector) {
         i.get()->contextCreated(
             v8_inspector::V8ContextInfo(context, 1, jsg::toInspectorStringView("Worker")));
       }
-      Worker::setupContext(*lock, context, loggingOptions);
+      Worker::setupContext(*lock, context, loggingOptions, outConsoleOriginals);
     }
 
     void disposeContext(jsg::JsContext<api::ServiceWorkerGlobalScope> context) {
@@ -880,6 +885,12 @@ struct Worker::Script::Impl {
   kj::Array<CompiledGlobal> globals;
 
   kj::Maybe<jsg::JsContext<api::ServiceWorkerGlobalScope>> moduleContext;
+
+  // For modular (ESM) workers, setupContext() is called during Script construction (not Worker
+  // construction), so outConsoleOriginals must be stored here rather than in Worker::Impl.
+  // Raw v8::Global<v8::Function> handles for the original console.debug/error/info/log/warn
+  // functions, saved before we replace them with our logging wrappers. Required for snapshot.
+  kj::Vector<std::shared_ptr<v8::Global<v8::Function>>> consoleOriginals;
 
   // If set, then any attempt to use this script shall throw this exception.
   kj::Maybe<kj::Exception> permanentException;
@@ -1395,7 +1406,7 @@ Worker::Script::Script(kj::Own<const Isolate> isolateParam,
             }));
         mContext->enableWarningOnSpecialEvents();
         context = mContext.getHandle(lock);
-        recordedLock.setupContext(context);
+        recordedLock.setupContext(context, &impl->consoleOriginals);
       } else {
         // Although we're going to compile a script independent of context, V8 requires that
         // there be an active context, otherwise it will segfault, I guess. So we create a
@@ -1719,8 +1730,10 @@ void shimWebAssemblyInstantiate(jsg::Lock& lock, v8::Local<v8::Context> context)
       jsg::JsFunction(registerFn), jsg::JsObject(webAssembly));
 }
 
-void Worker::setupContext(
-    jsg::Lock& lock, v8::Local<v8::Context> context, const LoggingOptions& loggingOptions) {
+void Worker::setupContext(jsg::Lock& lock,
+    v8::Local<v8::Context> context,
+    const LoggingOptions& loggingOptions,
+    kj::Vector<std::shared_ptr<v8::Global<v8::Function>>>* outConsoleOriginals) {
   // Set WebAssembly.Module @@HasInstance
   //setWebAssemblyModuleHasInstance(lock, context);  SnapshotCreator's isolate doesn't have access to WebAssembly
 
@@ -1737,13 +1750,17 @@ void Worker::setupContext(
 
   auto setHandler = [&](const char* method, LogLevel level) {
     auto methodStr = jsg::v8StrIntern(lock.v8Isolate, method);
-    v8::Global<v8::Function> original(
+    auto originalPtr = std::make_shared<v8::Global<v8::Function>>(
         lock.v8Isolate, jsg::check(console->Get(context, methodStr)).As<v8::Function>());
 
+    if (outConsoleOriginals != nullptr) {
+      outConsoleOriginals->add(originalPtr);
+    }
+
     auto f = lock.wrapSimpleFunction(context,
-        [loggingOptions, level, original = kj::mv(original)](
+        [loggingOptions, level, original = kj::mv(originalPtr)](
             jsg::Lock& js, const v8::FunctionCallbackInfo<v8::Value>& info) {
-      handleLog(js, loggingOptions, level, original, info);
+      handleLog(js, loggingOptions, level, *original, info);
     });
     jsg::check(console->Set(context, methodStr, f));
   };
@@ -1882,7 +1899,7 @@ Worker::Worker(kj::Own<const Script> scriptParam,
       script->installVirtualFileSystemOnContext(context);
 
       if (!script->modular) {
-        recordedLock.setupContext(context);
+        recordedLock.setupContext(context, &impl->consoleOriginals);
       }
 
       if (script->impl->unboundScriptOrMainModule == nullptr) {
@@ -2042,18 +2059,161 @@ Worker::Worker(kj::Own<const Script> scriptParam,
         lock.v8Isolate->SetCaptureStackTraceForUncaughtExceptions(false);
       }
 
-      // Create a V8 snapshot blob after stage 2
-      auto maybeexp = kj::runCatchingExceptions([&]() {
-        jsg::Lock& js = lock;
-        auto& isolateBase = jsg::IsolateBase::from(js.v8Isolate);
-        isolateBase.getSnapshotCreator()->SetDefaultContext(context);
-        auto blob = isolateBase.getSnapshotCreator()->CreateBlob(
-            v8::SnapshotCreator::FunctionCodeHandling::kClear);
-        KJ_DBG("Created snapshot blob!", blob.raw_size, blob.data);
-      });
+      {
+        // Creating snapshot.
 
-      KJ_IF_SOME(exp, maybeexp) {
-        KJ_DBG(exp);
+        // Snapshot part 1: Enumerate all persistent handles.
+        using V8Handle = kj::OneOf<v8::Global<v8::FunctionTemplate>*, v8::Global<v8::Object>*,
+            v8::Global<v8::Name>*, v8::Global<v8::DictionaryTemplate>*, v8::Global<v8::Data>*,
+            v8::Global<v8::Function>*, v8::Global<v8::Context>*>;
+        kj::Vector<V8Handle> activeHandles;
+
+        {
+          // Isolate's handles.
+
+          auto& isolateBase = jsg::IsolateBase::from(lock.v8Isolate);
+          isolateBase.visitPersistentHandles(
+              [&](v8::Global<v8::FunctionTemplate>& handle) { activeHandles.add(&handle); },
+              [&](v8::Global<v8::Object>& handle) { activeHandles.add(&handle); },
+              [&](v8::Global<v8::Name>& handle) { activeHandles.add(&handle); },
+              [&](v8::Global<v8::DictionaryTemplate>& handle) { activeHandles.add(&handle); });
+        }
+
+        {
+          // Worker's handles.
+
+          // TODO(dbezhetskov): remove visit and cast impl->env to JSContext directly.
+          KJ_IF_SOME(e, impl->env) {
+            e.visitHandle([&](auto& h) { activeHandles.add(&h); });
+          }
+          KJ_IF_SOME(e, impl->ctxExports) {
+            e.visitHandle([&](auto& h) { activeHandles.add(&h); });
+          }
+          KJ_ASSERT(impl->context == kj::none);
+
+          {
+            auto visitExportedFunc = [&](auto& maybeFunc) {
+              KJ_IF_SOME(f, maybeFunc) {
+                f.visitHandlesForSnapshot([&](auto& h) { activeHandles.add(&h); });
+              }
+            };
+            auto visitHandler = [&](api::ExportedHandler& handler) {
+              handler.env.visitHandle([&](auto& h) { activeHandles.add(&h); });
+              handler.self.visitHandle([&](auto& h) { activeHandles.add(&h); });
+              visitExportedFunc(handler.fetch);
+              visitExportedFunc(handler.connect);
+              visitExportedFunc(handler.tail);
+              visitExportedFunc(handler.trace);
+              visitExportedFunc(handler.tailStream);
+              visitExportedFunc(handler.scheduled);
+              visitExportedFunc(handler.alarm);
+              visitExportedFunc(handler.test);
+              visitExportedFunc(handler.webSocketMessage);
+              visitExportedFunc(handler.webSocketClose);
+              visitExportedFunc(handler.webSocketError);
+            };
+            for (auto& entry: impl->namedHandlers) {
+              visitHandler(entry.value);
+            }
+          }
+
+          KJ_ASSERT(impl->consoleOriginals.size() == 0);
+        }
+
+        {
+          // Script's handles.
+
+          // TODO(dbezhetskov): damn const_cast, why Script is even const unique pointer in the first place?
+          auto* scriptImpl = const_cast<Worker::Script::Impl*>(script->impl.get());
+
+          KJ_ASSERT_NONNULL(scriptImpl->moduleContext);
+          KJ_IF_SOME(moduleContext, scriptImpl->moduleContext) {
+            moduleContext.visitHandle([&](auto& h) { activeHandles.add(&h); });
+
+            // // TODO(dbezhetskov): I don't need to reset this before adding it to the snapshot!
+            // // Reset the Wrappable's TracedReference (wrapper) and strong Global (strongWrapper)
+            // // for the context global object (ServiceWorkerGlobalScope = JSGlobalProxy). These are
+            // // not AddData'd because SetDefaultContext captures the global proxy automatically.
+            moduleContext->resetHandlesForSnapshot();
+          }
+
+          KJ_ASSERT(scriptImpl->globals.size() == 0);
+
+          // For modular (ESM) workers, console originals are stored in Script::Impl because
+          // setupContext() runs during Script construction (not Worker construction).
+          for (auto& h: script->impl->consoleOriginals) {
+            activeHandles.add(h.get());
+          }
+        }
+
+        auto maybeexp = kj::runCatchingExceptions([&]() {
+          jsg::Lock& js = lock;
+          jsg::IsolateBase& isolateBase = jsg::IsolateBase::from(js.v8Isolate);
+
+          // Snapshot part 2: Preserve js objects in the snapshot.
+          for (auto& handle: activeHandles) {
+            KJ_SWITCH_ONEOF(handle) {
+              KJ_CASE_ONEOF(h, v8::Global<v8::FunctionTemplate>*) {
+                isolateBase.getSnapshotCreator()->AddData(h->Get(lock.v8Isolate));
+              }
+              KJ_CASE_ONEOF(h, v8::Global<v8::Object>*) {
+                isolateBase.getSnapshotCreator()->AddData(h->Get(lock.v8Isolate));
+              }
+              KJ_CASE_ONEOF(h, v8::Global<v8::Name>*) {
+                isolateBase.getSnapshotCreator()->AddData(h->Get(lock.v8Isolate));
+              }
+              KJ_CASE_ONEOF(h, v8::Global<v8::DictionaryTemplate>*) {
+                isolateBase.getSnapshotCreator()->AddData(h->Get(lock.v8Isolate));
+              }
+              KJ_CASE_ONEOF(h, v8::Global<v8::Data>*) {
+                isolateBase.getSnapshotCreator()->AddData(h->Get(lock.v8Isolate));
+              }
+              KJ_CASE_ONEOF(h, v8::Global<v8::Function>*) {
+                isolateBase.getSnapshotCreator()->AddData(h->Get(lock.v8Isolate));
+              }
+              KJ_CASE_ONEOF(h, v8::Global<v8::Context>*) {
+                isolateBase.getSnapshotCreator()->AddData(h->Get(lock.v8Isolate));
+              }
+            }
+          }
+
+          // Snapshot part 3: Reset all C++ handles.
+          for (auto& handle: activeHandles) {
+            KJ_SWITCH_ONEOF(handle) {
+              KJ_CASE_ONEOF(h, v8::Global<v8::FunctionTemplate>*) {
+                h->Reset();
+              }
+              KJ_CASE_ONEOF(h, v8::Global<v8::Object>*) {
+                h->Reset();
+              }
+              KJ_CASE_ONEOF(h, v8::Global<v8::Name>*) {
+                h->Reset();
+              }
+              KJ_CASE_ONEOF(h, v8::Global<v8::DictionaryTemplate>*) {
+                h->Reset();
+              }
+              KJ_CASE_ONEOF(h, v8::Global<v8::Data>*) {
+                h->Reset();
+              }
+              KJ_CASE_ONEOF(h, v8::Global<v8::Function>*) {
+                h->Reset();
+              }
+              KJ_CASE_ONEOF(h, v8::Global<v8::Context>*) {
+                h->Reset();
+              }
+            }
+          }
+
+          // Snapshot part 4: Create snapshot blob.
+          isolateBase.getSnapshotCreator()->SetDefaultContext(context);
+          auto blob = isolateBase.getSnapshotCreator()->CreateBlob(
+              v8::SnapshotCreator::FunctionCodeHandling::kClear);
+          KJ_DBG("Created snapshot blob!", blob.raw_size, blob.data);
+        });
+
+        KJ_IF_SOME(exp, maybeexp) {
+          KJ_DBG(exp);
+        }
       }
     });
   });

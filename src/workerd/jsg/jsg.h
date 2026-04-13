@@ -859,6 +859,15 @@ class Data {
   // Get the raw underlying v8 handle.
   v8::Local<v8::Data> getHandle(Lock& js) const;
 
+  // Call fn with the underlying v8::Global<v8::Data> handle.
+  // Also resets tracedHandle, which V8 would otherwise report as an unserialized eternal handle
+  // during snapshot creation (TracedReferences are stored alongside eternal handles internally).
+  template <typename Fn>
+  void visitHandle(Fn&& fn) {
+    fn(handle);
+    tracedHandle = kj::none;
+  }
+
   Data addRef(v8::Isolate* isolate) {
     return Data(isolate, getHandle(isolate));
   }
@@ -950,6 +959,8 @@ class V8Ref: private Data {
 
   template <typename U>
   V8Ref<U> cast(jsg::Lock& js);
+
+  using Data::visitHandle;
 
  private:
   friend class GcVisitor;
@@ -1181,6 +1192,12 @@ class Object: private Wrappable {
   Object() = default;
 
   inline void jsgVisitForGc(GcVisitor& visitor) override {}
+
+  // Reset JS wrapper handles before V8 snapshot creation. Forwards to Wrappable through the
+  // private inheritance so callers don't need friend access to Wrappable.
+  inline void resetHandlesForSnapshot() {
+    Wrappable::resetHandlesForSnapshot();
+  }
 
   // Subclasses should override these to provide appropriate information for
   // the heap snapshot process.
@@ -1744,6 +1761,16 @@ class JsContext {
     return handle.Get(isolate);
   }
   v8::Local<v8::Context> getHandle(Lock& js) const;
+
+  void resetHandle() {
+    handle.Reset();
+  }
+
+  // Call fn with the underlying v8::Global<v8::Context> handle.
+  template <typename Fn>
+  void visitHandle(Fn&& fn) {
+    fn(handle);
+  }
 
  private:
   v8::Global<v8::Context> handle;

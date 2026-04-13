@@ -460,6 +460,21 @@ class TypeWrapper: public DynamicResourceTypeMap<Self>,
     (TypeWrapperBase<Self, T>::initTypeWrapper(), ...);
   }
 
+  void visitHandles(
+      kj::FunctionParam<void(v8::Global<v8::FunctionTemplate>&)> visitorFunctionTemplate,
+      kj::FunctionParam<void(v8::Global<v8::Name>&)> visitName,
+      kj::FunctionParam<void(v8::Global<v8::DictionaryTemplate>&)> visitDictionaryTemplate) {
+    ([&] {
+      if constexpr (T::JSG_KIND == JsgKind::RESOURCE) {
+        static_cast<ResourceWrapper<Self, T>*>(this)->visitConstructorHandles(
+            visitorFunctionTemplate);
+      } else if constexpr (T::JSG_KIND == JsgKind::STRUCT) {
+        using SW = StructWrapper<Self, T, typename T::template JsgFieldWrappers<Self, T>>;
+        static_cast<SW*>(this)->visitPersistentHandles(visitName, visitDictionaryTemplate);
+      }
+    }(), ...);
+  }
+
   static TypeWrapper& from(v8::Isolate* isolate) {
     return *reinterpret_cast<TypeWrapper*>(isolate->GetData(SET_DATA_TYPE_WRAPPER));
   }
