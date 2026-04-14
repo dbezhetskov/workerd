@@ -318,7 +318,22 @@ void Wrappable::maybeDeferDestruction(bool strong, kj::Own<void> ownSelf, Wrappa
   }
 }
 
+void Wrappable::resetHandlesForSnapshot() {
+  KJ_IF_SOME(w, wrapper) {
+    w.Reset();
+  }
+  wrapper = kj::none;
+  strongWrapper.Reset();
+  // Freelist the CppgcShim so that GC triggered by CreateBlob() does not call traceFromV8()
+  // with an already-cleared wrapper, which would crash on KJ_ASSERT_NONNULL.
+  KJ_IF_SOME(shim, cppgcShim) {
+    HeapTracer::getTracer(isolate).addToFreelist(shim);
+    cppgcShim = kj::none;
+  }
+}
+
 void Wrappable::traceFromV8(cppgc::Visitor& cppgcVisitor) {
+  KJ_DBG(typeid(*this).name(), (void*)this);
   cppgcVisitor.Trace(KJ_ASSERT_NONNULL(wrapper));
   GcVisitor visitor(*this, cppgcVisitor);
   jsgVisitForGc(visitor);

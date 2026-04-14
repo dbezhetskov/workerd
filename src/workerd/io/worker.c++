@@ -508,6 +508,9 @@ class Worker::InspectorClient: public v8_inspector::V8InspectorClient {
 
 static thread_local const Worker::Api* currentApi = nullptr;
 
+// Number of console methods wrapped by setupContext (debug, error, info, log, warn).
+static constexpr size_t kConsoleOriginalsCount = 5;
+
 const Worker::Api& Worker::Api::current() {
   KJ_REQUIRE(currentApi != nullptr, "not running JavaScript");
   return *currentApi;
@@ -537,10 +540,6 @@ struct Worker::Impl {
 
   // If set, then any attempt to use this worker shall throw this exception.
   kj::Maybe<kj::Exception> permanentException;
-
-  // Shared handles to original console functions, populated by setupContext.
-  // Stored via shared_ptr so the same Global can be Reset from outside the lambda closure.
-  kj::Vector<std::shared_ptr<v8::Global<v8::Function>>> consoleOriginals;
 };
 
 // Note that Isolate mutable state is protected by locking the JsgWorkerIsolate unless otherwise
@@ -648,14 +647,13 @@ struct Worker::Isolate::Impl {
     }
     KJ_DISALLOW_COPY_AND_MOVE(Lock);
 
-    void setupContext(v8::Local<v8::Context> context,
-        kj::Vector<std::shared_ptr<v8::Global<v8::Function>>>* outConsoleOriginals = nullptr) {
+    void setupContext(v8::Local<v8::Context> context, ConsoleMethod* outConsoleMethods = nullptr) {
       // The V8Inspector implements the `console` object.
       KJ_IF_SOME(i, impl.inspector) {
         i.get()->contextCreated(
             v8_inspector::V8ContextInfo(context, 1, jsg::toInspectorStringView("Worker")));
       }
-      Worker::setupContext(*lock, context, loggingOptions, outConsoleOriginals);
+      Worker::setupContext(*lock, context, loggingOptions, outConsoleMethods);
     }
 
     void disposeContext(jsg::JsContext<api::ServiceWorkerGlobalScope> context) {
@@ -887,10 +885,10 @@ struct Worker::Script::Impl {
   kj::Maybe<jsg::JsContext<api::ServiceWorkerGlobalScope>> moduleContext;
 
   // For modular (ESM) workers, setupContext() is called during Script construction (not Worker
-  // construction), so outConsoleOriginals must be stored here rather than in Worker::Impl.
-  // Raw v8::Global<v8::Function> handles for the original console.debug/error/info/log/warn
-  // functions, saved before we replace them with our logging wrappers. Required for snapshot.
-  kj::Vector<std::shared_ptr<v8::Global<v8::Function>>> consoleOriginals;
+  // construction), so consoleMethods is stored here rather than in Worker::Impl.
+  // Holds the original console.debug/error/info/log/warn functions and their decorator wrappers.
+  // Required for snapshot.
+  ConsoleMethod consoleMethods[kConsoleOriginalsCount];
 
   // If set, then any attempt to use this script shall throw this exception.
   kj::Maybe<kj::Exception> permanentException;
@@ -1406,7 +1404,7 @@ Worker::Script::Script(kj::Own<const Isolate> isolateParam,
             }));
         mContext->enableWarningOnSpecialEvents();
         context = mContext.getHandle(lock);
-        recordedLock.setupContext(context, &impl->consoleOriginals);
+        recordedLock.setupContext(context, impl->consoleMethods);
       } else {
         // Although we're going to compile a script independent of context, V8 requires that
         // there be an active context, otherwise it will segfault, I guess. So we create a
@@ -1733,7 +1731,7 @@ void shimWebAssemblyInstantiate(jsg::Lock& lock, v8::Local<v8::Context> context)
 void Worker::setupContext(jsg::Lock& lock,
     v8::Local<v8::Context> context,
     const LoggingOptions& loggingOptions,
-    kj::Vector<std::shared_ptr<v8::Global<v8::Function>>>* outConsoleOriginals) {
+    Worker::ConsoleMethod* outConsoleMethods) {
   // Set WebAssembly.Module @@HasInstance
   //setWebAssemblyModuleHasInstance(lock, context);  SnapshotCreator's isolate doesn't have access to WebAssembly
 
@@ -1748,20 +1746,20 @@ void Worker::setupContext(jsg::Lock& lock,
   auto consoleStr = jsg::v8StrIntern(lock.v8Isolate, "console");
   auto console = jsg::check(global->Get(context, consoleStr)).As<v8::Object>();
 
+  size_t idx = 0;
   auto setHandler = [&](const char* method, LogLevel level) {
+    auto& consoleDecorator = outConsoleMethods[idx++];
     auto methodStr = jsg::v8StrIntern(lock.v8Isolate, method);
-    auto originalPtr = std::make_shared<v8::Global<v8::Function>>(
-        lock.v8Isolate, jsg::check(console->Get(context, methodStr)).As<v8::Function>());
+    auto originalFunc = jsg::check(console->Get(context, methodStr)).As<v8::Function>();
+    consoleDecorator.original.Reset(lock.v8Isolate, originalFunc);
 
-    if (outConsoleOriginals != nullptr) {
-      outConsoleOriginals->add(originalPtr);
-    }
-
-    auto f = lock.wrapSimpleFunction(context,
-        [loggingOptions, level, original = kj::mv(originalPtr)](
-            jsg::Lock& js, const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Worker::ConsoleFunction handler = [loggingOptions, level,
+                                          original = &consoleDecorator.original](jsg::Lock& js,
+                                          const v8::FunctionCallbackInfo<v8::Value>& info) {
       handleLog(js, loggingOptions, level, *original, info);
-    });
+    };
+    consoleDecorator.decorator = handler.addRef(lock.v8Isolate);
+    auto f = lock.wrapSimpleFunction(context, kj::mv(handler));
     jsg::check(console->Set(context, methodStr, f));
   };
 
@@ -1899,7 +1897,7 @@ Worker::Worker(kj::Own<const Script> scriptParam,
       script->installVirtualFileSystemOnContext(context);
 
       if (!script->modular) {
-        recordedLock.setupContext(context, &impl->consoleOriginals);
+        recordedLock.setupContext(context);
       }
 
       if (script->impl->unboundScriptOrMainModule == nullptr) {
@@ -2116,15 +2114,13 @@ Worker::Worker(kj::Own<const Script> scriptParam,
               visitHandler(entry.value);
             }
           }
-
-          KJ_ASSERT(impl->consoleOriginals.size() == 0);
         }
+
+        // TODO(dbezhetskov): damn const_cast, why Script is even const unique pointer in the first place?
+        auto* scriptImpl = const_cast<Worker::Script::Impl*>(script->impl.get());
 
         {
           // Script's handles.
-
-          // TODO(dbezhetskov): damn const_cast, why Script is even const unique pointer in the first place?
-          auto* scriptImpl = const_cast<Worker::Script::Impl*>(script->impl.get());
 
           KJ_ASSERT_NONNULL(scriptImpl->moduleContext);
           KJ_IF_SOME(moduleContext, scriptImpl->moduleContext) {
@@ -2141,8 +2137,10 @@ Worker::Worker(kj::Own<const Script> scriptParam,
 
           // For modular (ESM) workers, console originals are stored in Script::Impl because
           // setupContext() runs during Script construction (not Worker construction).
-          for (auto& h: script->impl->consoleOriginals) {
-            activeHandles.add(h.get());
+          for (auto& m: scriptImpl->consoleMethods) {
+            if (!m.original.IsEmpty()) {
+              activeHandles.add(&m.original);
+            }
           }
         }
 
@@ -2178,6 +2176,18 @@ Worker::Worker(kj::Own<const Script> scriptParam,
           }
 
           // Snapshot part 3: Reset all C++ handles.
+
+          // Reset jsg's decorator functions for console methods.
+          // Must call resetHandlesForSnapshot() before clearing the decorator: the
+          // WrappableFunctionImpl is still referenced by the JS function's data object on
+          // console.debug/error/etc., so its CppgcShim remains active. Without this call,
+          // GC inside CreateBlob() would call traceFromV8() on an already-cleared wrapper.
+          for (auto& m: scriptImpl->consoleMethods) {
+            KJ_IF_SOME(dec, m.decorator) {
+              dec.resetHandlesForSnapshot();
+            }
+          }
+
           for (auto& handle: activeHandles) {
             KJ_SWITCH_ONEOF(handle) {
               KJ_CASE_ONEOF(h, v8::Global<v8::FunctionTemplate>*) {

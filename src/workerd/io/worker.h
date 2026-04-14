@@ -213,10 +213,17 @@ class Worker: public kj::AtomicRefcounted {
   kj::Promise<AsyncLock> takeAsyncLockWhenActorCacheReady(
       kj::Date now, Actor& actor, RequestObserver& request) const;
 
+  using ConsoleFunction = jsg::Function<void(const v8::FunctionCallbackInfo<v8::Value>&)>;
+
+  struct ConsoleMethod {
+    v8::Global<v8::Function> original;
+    kj::Maybe<ConsoleFunction> decorator;
+  };
+
   static void setupContext(jsg::Lock& lock,
       v8::Local<v8::Context> context,
       const LoggingOptions& loggingOptions,
-      kj::Vector<std::shared_ptr<v8::Global<v8::Function>>>* outConsoleOriginals = nullptr);
+      ConsoleMethod* outConsoleMethods);
 
  private:
   kj::Own<const Script> script;

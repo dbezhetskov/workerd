@@ -211,6 +211,15 @@ class Function<Ret(Args...)> {
     __builtin_unreachable();
   }
 
+  void resetHandlesForSnapshot() {
+    KJ_SWITCH_ONEOF(impl) {
+      KJ_CASE_ONEOF(native, Ref<NativeFunction>) {
+        native->resetHandlesForSnapshot();
+      }
+      KJ_CASE_ONEOF(js, JsImpl) {}
+    }
+  }
+
   inline void visitForGc(GcVisitor& visitor) {
     KJ_SWITCH_ONEOF(impl) {
       KJ_CASE_ONEOF(native, Ref<NativeFunction>) {

@@ -144,10 +144,9 @@ class Wrappable: public kj::Refcounted {
   // all v8::Global and v8::TracedReference handles are either serialized via AddData() or cleared.
   // For context globals (e.g. ServiceWorkerGlobalScope), the wrapper is the JSGlobalProxy which
   // is already captured by SetDefaultContext(), so we just need to clear our C++ references.
-  void resetHandlesForSnapshot() {
-    wrapper = kj::none;
-    strongWrapper.Reset();
-  }
+  // Also freelists the CppgcShim so that GC triggered by CreateBlob() does not call traceFromV8()
+  // when wrapper is already cleared (which would crash on KJ_ASSERT_NONNULL).
+  void resetHandlesForSnapshot();
 
   // Called by jsg::Ref<T> to ensure that its Wrappable is destroyed under the isolate lock.
   // `ownSelf` keeps the raw `self` pointer valid -- they are passed separately because Wrappable is
