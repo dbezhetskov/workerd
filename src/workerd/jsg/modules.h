@@ -232,6 +232,12 @@ class ModuleRegistry {
 
   virtual void setDynamicImportCallback(kj::Function<DynamicImportCallback> func) = 0;
 
+  // Visit all v8::Global handles owned by instantiated module entries. Must be called (and
+  // handles passed to AddData) before SnapshotCreator::CreateBlob(), otherwise V8 reports
+  // unserialized global handles. Only meaningful for the old module registry; the new one
+  // (modules-new) holds no v8::Global handles directly.
+  virtual void visitHandlesForSnapshot(kj::FunctionParam<void(v8::Global<v8::Data>&)> fn) = 0;
+
   enum class RequireImplOptions {
     // Require returns the module namespace.
     DEFAULT,
@@ -492,12 +498,16 @@ class ModuleRegistryImpl final: public ModuleRegistry {
     return entries.size();
   }
 
+  void visitHandlesForSnapshot(kj::FunctionParam<void(v8::Global<v8::Data>&)> fn) override {
+    visitHandlesForSnapshotImpl(fn);
+  }
+
   // Visit all v8::Global handles owned by instantiated ModuleInfo entries for V8 snapshot
   // creation.
   // Also resets tracedHandle on each jsg::Data (via visitHandle()) so V8's snapshot creator
   // does not report dangling TracedReferences.
   template <typename Fn>
-  void visitHandlesForSnapshot(Fn&& fn) {
+  void visitHandlesForSnapshotImpl(Fn&& fn) {
     for (auto& entry: entries) {
       KJ_IF_SOME(info, entry->info.template tryGet<ModuleInfo>()) {
         const_cast<ModuleInfo&>(info).module.visitHandle(fn);

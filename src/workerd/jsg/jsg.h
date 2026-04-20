@@ -1762,10 +1762,6 @@ class JsContext {
   }
   v8::Local<v8::Context> getHandle(Lock& js) const;
 
-  void resetHandle() {
-    handle.Reset();
-  }
-
   // Call fn with the underlying v8::Global<v8::Context> handle.
   template <typename Fn>
   void visitHandle(Fn&& fn) {

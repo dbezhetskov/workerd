@@ -216,6 +216,12 @@ class ExecutionContext: public jsg::Object {
   void waitUntil(kj::Promise<void> promise);
   void passThroughOnException();
 
+  void resetHandlesForSnapshot() {
+    exports.visitHandle([](auto& h) { h.Reset(); });
+    props.visitHandle([](auto& h) { h.Reset(); });
+    version = kj::none;
+  }
+
   // Cancels the current execution context with the given exception, causing all execution to stop
   // and throwing an error at the client.
   void abort(jsg::Lock& js, jsg::Optional<jsg::Value> reason);

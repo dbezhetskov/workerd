@@ -779,6 +779,11 @@ class JsRef final {
     return kj::mv(value).template cast<U>(jsg::Lock::current());
   }
 
+  template <typename Fn>
+  void visitHandle(Fn&& fn) {
+    value.visitHandle(kj::fwd<Fn>(fn));
+  }
+
   JSG_MEMORY_INFO(JsRef) {
     tracker.trackField("value", value);
   }

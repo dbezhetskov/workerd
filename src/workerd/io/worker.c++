@@ -2080,7 +2080,6 @@ Worker::Worker(kj::Own<const Script> scriptParam,
         {
           // Worker's handles.
 
-          // TODO(dbezhetskov): remove visit and cast impl->env to JSContext directly.
           KJ_IF_SOME(e, impl->env) {
             e.visitHandle([&](auto& h) { activeHandles.add(&h); });
           }
@@ -2125,12 +2124,6 @@ Worker::Worker(kj::Own<const Script> scriptParam,
           KJ_ASSERT_NONNULL(scriptImpl->moduleContext);
           KJ_IF_SOME(moduleContext, scriptImpl->moduleContext) {
             moduleContext.visitHandle([&](auto& h) { activeHandles.add(&h); });
-
-            // // TODO(dbezhetskov): I don't need to reset this before adding it to the snapshot!
-            // // Reset the Wrappable's TracedReference (wrapper) and strong Global (strongWrapper)
-            // // for the context global object (ServiceWorkerGlobalScope = JSGlobalProxy). These are
-            // // not AddData'd because SetDefaultContext captures the global proxy automatically.
-            moduleContext->resetHandlesForSnapshot();
           }
 
           KJ_ASSERT(scriptImpl->globals.size() == 0);
@@ -2186,6 +2179,23 @@ Worker::Worker(kj::Own<const Script> scriptParam,
             KJ_IF_SOME(dec, m.decorator) {
               dec.resetHandlesForSnapshot();
             }
+          }
+
+          KJ_IF_SOME(moduleContext, scriptImpl->moduleContext) {
+            moduleContext->resetHandlesForSnapshot();
+          }
+
+          for (auto& entry: impl->namedHandlers) {
+            KJ_IF_SOME(ctx, entry.value.ctx) {
+              ctx->resetHandlesForSnapshot();
+            }
+          }
+
+          // Reset module registry handles.
+          if (scriptImpl->maybeNewModuleRegistry == kj::none) {
+            v8::Context::Scope contextScope(context);
+            jsg::ModuleRegistry::from(js)->visitHandlesForSnapshot(
+                [](v8::Global<v8::Data>& h) { h.Reset(); });
           }
 
           for (auto& handle: activeHandles) {
