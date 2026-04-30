@@ -2225,6 +2225,10 @@ Worker::Worker(kj::Own<const Script> scriptParam,
           }
 
           // Snapshot part 4: Create snapshot blob.
+          // Terminate the V8 external_references array. ResourceTypeBuilder has been pushing
+          // callback pointers into IsolateBase::externalReferences as types were wrapped during
+          // worker setup; V8 reads up to the trailing 0 inside CreateBlob().
+          isolateBase.getExternalReferences().add(0);
           isolateBase.getSnapshotCreator()->SetDefaultContext(context);
           auto blob = isolateBase.getSnapshotCreator()->CreateBlob(
               v8::SnapshotCreator::FunctionCodeHandling::kClear);

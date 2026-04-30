@@ -245,11 +245,6 @@ struct WorkerdApi::Impl final {
   api::MemoryCacheProvider& memoryCacheProvider;
   const PythonConfig& pythonConfig;
 
-  static v8::Isolate::CreateParams addExternalReferences(v8::Isolate::CreateParams params) {
-    params.external_references = JsgWorkerdIsolate::buildExternalReferences();
-    return params;
-  }
-
   class Configuration {
    public:
     Configuration(Impl& impl)
@@ -290,7 +285,7 @@ struct WorkerdApi::Impl final {
             Configuration(*this),
             kj::mv(observerParam),
             jsg::defaultExternalStringAllocator(),
-            addExternalReferences(kj::mv(createParams))),
+            kj::mv(createParams)),
         memoryCacheProvider(memoryCacheProvider),
         pythonConfig(pythonConfig) {
     jsgIsolate.runInLockScope([&](JsgWorkerdIsolate::Lock& lock) {

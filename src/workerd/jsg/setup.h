@@ -351,6 +351,14 @@ class IsolateBase {
     if (!workerExportsObj.IsEmpty()) visitObj(workerExportsObj);
   }
 
+  // Per-isolate V8 external_references vector. ResourceTypeBuilder pushes callback pointers
+  // here as it registers them with V8. Capacity is reserved upfront in the constructor so
+  // the .begin() pointer cached by V8 stays stable as we grow.
+  // Append the trailing 0 terminator once, just before SnapshotCreator::CreateBlob().
+  kj::Vector<intptr_t>& getExternalReferences() {
+    return externalReferences;
+  }
+
  private:
   template <typename TypeWrapper>
   friend class Isolate;
@@ -387,6 +395,11 @@ class IsolateBase {
   // TODO(cleanup): After v8 13.4 is fully released we can inline this into `newIsolate`
   //                and remove this member.
   std::unique_ptr<class v8::CppHeap> cppHeap;
+  // V8 external references. ResourceTypeBuilder pushes callback pointers here as it registers
+  // them with V8 (lazy, on first wrap of each type). Capacity is reserved upfront so the .begin()
+  // pointer we pass to V8 stays stable. Terminating 0 is appended once just before
+  // SnapshotCreator::CreateBlob() in worker.c++.
+  kj::Vector<intptr_t> externalReferences;
   kj::Own<v8::SnapshotCreator> snapshotCreator;
   v8::Isolate* ptr;
   // When true, evalAllowed is true and switching it to false is a no-op.
@@ -531,6 +544,14 @@ class IsolateBase {
   // this template.
   static v8::Local<v8::FunctionTemplate> getOpaqueTemplate(v8::Isolate* isolate);
 };
+
+inline void isolateAddExternalReference(v8::Isolate* isolate, intptr_t addr) {
+  auto& refs = IsolateBase::from(isolate).getExternalReferences();
+  KJ_DREQUIRE(refs.size() < refs.capacity(),
+      "external_references vector grew past reserved capacity; "
+      "bump kExternalReferencesCapacity in setup.c++");
+  refs.add(addr);
+}
 
 // If JavaScript frames are currently on the stack, returns a string representing a stack trace
 // through it. The trace is built inside `scratch` without performing any allocation. This is

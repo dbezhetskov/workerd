@@ -392,6 +392,19 @@ static kj::Own<v8::SnapshotCreator> newSnapshotCreator(
   });
 }
 }  // namespace
+namespace {
+// Reserve enough capacity that the .begin() pointer V8 caches at isolate creation never moves
+// due to reallocation. Plenty for ~6.5k callbacks in workerd.
+constexpr size_t kExternalReferencesCapacity = 16384;
+
+v8::Isolate::CreateParams&& wireExternalReferences(
+    v8::Isolate::CreateParams& createParams, kj::Vector<intptr_t>& externalReferences) {
+  externalReferences.reserve(kExternalReferencesCapacity);
+  createParams.external_references = externalReferences.begin();
+  return kj::mv(createParams);
+}
+}  // namespace
+
 IsolateBase::IsolateBase(V8System& system,
     v8::Isolate::CreateParams&& createParams,
     kj::Own<IsolateObserver> observer,
@@ -399,7 +412,8 @@ IsolateBase::IsolateBase(V8System& system,
     v8::IsolateGroup group)
     : v8System(system),
       cppHeap(newCppHeap(const_cast<V8PlatformWrapper*>(system.platformWrapper.get()))),
-      snapshotCreator(newSnapshotCreator(kj::mv(createParams), cppHeap.release())),
+      snapshotCreator(newSnapshotCreator(
+          wireExternalReferences(createParams, externalReferences), cppHeap.release())),
       ptr(snapshotCreator->GetIsolate()),
       externalMemoryTarget(kj::arc<ExternalMemoryTarget>(ptr)),
       envAsyncContextKey(kj::refcounted<AsyncContextFrame::StorageKey>()),
