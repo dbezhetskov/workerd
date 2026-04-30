@@ -540,6 +540,9 @@ struct Worker::Impl {
 
   // If set, then any attempt to use this worker shall throw this exception.
   kj::Maybe<kj::Exception> permanentException;
+
+  // Populated only when this worker was constructed with createSnapshot=CreateSnapshot::YES.
+  kj::Maybe<SnapshotArtifact> snapshotArtifact;
 };
 
 // Note that Isolate mutable state is protected by locking the JsgWorkerIsolate unless otherwise
@@ -647,13 +650,18 @@ struct Worker::Isolate::Impl {
     }
     KJ_DISALLOW_COPY_AND_MOVE(Lock);
 
-    void setupContext(v8::Local<v8::Context> context, ConsoleMethod* outConsoleMethods = nullptr) {
+    void setupContext(v8::Local<v8::Context> context) {
       // The V8Inspector implements the `console` object.
       KJ_IF_SOME(i, impl.inspector) {
         i.get()->contextCreated(
             v8_inspector::V8ContextInfo(context, 1, jsg::toInspectorStringView("Worker")));
       }
-      Worker::setupContext(*lock, context, loggingOptions, outConsoleMethods);
+      Worker::setupContext(*lock, context, loggingOptions);
+    }
+
+    void setupConsoleMethods(
+        v8::Local<v8::Context> context, Worker::ConsoleMethod* outConsoleMethods) {
+      Worker::setupConsoleMethods(*lock, context, loggingOptions, outConsoleMethods);
     }
 
     void disposeContext(jsg::JsContext<api::ServiceWorkerGlobalScope> context) {
@@ -1404,7 +1412,7 @@ Worker::Script::Script(kj::Own<const Isolate> isolateParam,
             }));
         mContext->enableWarningOnSpecialEvents();
         context = mContext.getHandle(lock);
-        recordedLock.setupContext(context, impl->consoleMethods);
+        recordedLock.setupContext(context);
       } else {
         // Although we're going to compile a script independent of context, V8 requires that
         // there be an active context, otherwise it will segfault, I guess. So we create a
@@ -1728,10 +1736,12 @@ void shimWebAssemblyInstantiate(jsg::Lock& lock, v8::Local<v8::Context> context)
       jsg::JsFunction(registerFn), jsg::JsObject(webAssembly));
 }
 
-void Worker::setupContext(jsg::Lock& lock,
-    v8::Local<v8::Context> context,
-    const LoggingOptions& loggingOptions,
-    Worker::ConsoleMethod* outConsoleMethods) {
+void Worker::setupContext(
+    jsg::Lock& lock, v8::Local<v8::Context> context, const LoggingOptions& loggingOptions) {
+  // Phase 1: only context setup that is safe to bake into a V8 snapshot.
+  // (void)loggingOptions kept for ABI parity with setupConsoleMethods, but unused here today.)
+  (void)loggingOptions;
+
   // Set WebAssembly.Module @@HasInstance
   //setWebAssemblyModuleHasInstance(lock, context);  SnapshotCreator's isolate doesn't have access to WebAssembly
 
@@ -1739,9 +1749,17 @@ void Worker::setupContext(jsg::Lock& lock,
   if (util::Autogate::isEnabled(util::AutogateKey::WASM_SHUTDOWN_SIGNAL_SHIM)) {
     shimWebAssemblyInstantiate(lock, context);
   }
+}
 
-  // We replace the default V8 console.log(), etc. methods, to give the worker access to
-  // logged content, and log formatted values to stdout/stderr locally.
+void Worker::setupConsoleMethods(jsg::Lock& lock,
+    v8::Local<v8::Context> context,
+    const LoggingOptions& loggingOptions,
+    Worker::ConsoleMethod* outConsoleMethods) {
+  // Phase 2: replace V8's default console.log(), etc. with logging decorators.
+  // MUST NOT run during snapshot save: wrapSimpleFunction creates a FunctionTemplate whose
+  // `data` holds a C++ closure (a JSObject reachable from the FunctionTemplateInfo) that in
+  // turn references the original console JSFunction. V8's StartupSerializer rejects
+  // JSFunction reachable from the isolate snapshot.
   auto global = context->Global();
   auto consoleStr = jsg::v8StrIntern(lock.v8Isolate, "console");
   auto console = jsg::check(global->Get(context, consoleStr)).As<v8::Object>();
@@ -1831,6 +1849,7 @@ Worker::Worker(kj::Own<const Script> scriptParam,
     IsolateObserver::StartType startType,
     SpanParent parentSpan,
     LockType lockType,
+    CreateSnapshot createSnapshot,
     kj::Maybe<ValidationErrorReporter&> errorReporter,
     kj::Maybe<kj::Duration&> startupTime)
     : script(kj::mv(scriptParam)),
@@ -1909,6 +1928,17 @@ Worker::Worker(kj::Own<const Script> scriptParam,
 
       // Enter the context for compiling and running the script.
       JSG_WITHIN_CONTEXT_SCOPE(lock, context, [&](jsg::Lock& js) {
+        // Phase 2 of context setup, runtime-only. Skipped for blueprint workers because
+        // the decorator's FunctionTemplate carries a JSObject in its `data` slot referencing
+        // the original console JSFunction, which V8's StartupSerializer rejects in CreateBlob.
+        // Must run before user top-level code so the script's first console.log lands on the
+        // decorated function. consoleMethods storage lives on Script::Impl (see comment there).
+        if (!createSnapshot) {
+          // const_cast OK: guarded by isolate lock.
+          auto* scriptImpl = const_cast<Worker::Script::Impl*>(script->impl.get());
+          recordedLock.setupConsoleMethods(context, scriptImpl->consoleMethods);
+        }
+
         v8::TryCatch catcher(lock.v8Isolate);
         ExceptionOrDuration limitErrorOrTime = 0 * kj::NANOSECONDS;
 
@@ -2057,7 +2087,7 @@ Worker::Worker(kj::Own<const Script> scriptParam,
         lock.v8Isolate->SetCaptureStackTraceForUncaughtExceptions(false);
       }
 
-      {
+      if (createSnapshot) {
         // Creating snapshot.
 
         // Snapshot part 1: Enumerate all persistent handles.
@@ -2145,25 +2175,29 @@ Worker::Worker(kj::Own<const Script> scriptParam,
           for (auto& handle: activeHandles) {
             KJ_SWITCH_ONEOF(handle) {
               KJ_CASE_ONEOF(h, v8::Global<v8::FunctionTemplate>*) {
-                isolateBase.getSnapshotCreator()->AddData(h->Get(lock.v8Isolate));
+                // FunctionTemplate may carry a context-bound data value (e.g. JSObject set via
+                // SetCallHandler). Route through context to be safe.
+                isolateBase.getSnapshotCreator()->AddData(context, h->Get(lock.v8Isolate));
               }
               KJ_CASE_ONEOF(h, v8::Global<v8::Object>*) {
-                isolateBase.getSnapshotCreator()->AddData(h->Get(lock.v8Isolate));
+                isolateBase.getSnapshotCreator()->AddData(context, h->Get(lock.v8Isolate));
               }
               KJ_CASE_ONEOF(h, v8::Global<v8::Name>*) {
-                isolateBase.getSnapshotCreator()->AddData(h->Get(lock.v8Isolate));
+                isolateBase.getSnapshotCreator()->AddData(context, h->Get(lock.v8Isolate));
               }
               KJ_CASE_ONEOF(h, v8::Global<v8::DictionaryTemplate>*) {
-                isolateBase.getSnapshotCreator()->AddData(h->Get(lock.v8Isolate));
+                isolateBase.getSnapshotCreator()->AddData(context, h->Get(lock.v8Isolate));
               }
               KJ_CASE_ONEOF(h, v8::Global<v8::Data>*) {
-                isolateBase.getSnapshotCreator()->AddData(h->Get(lock.v8Isolate));
+                // v8::Global<v8::Data> is a generic holder that often wraps JSFunctions or
+                // JSObjects (jsg::Data, jsg::Function::receiver/handle). Route through context.
+                isolateBase.getSnapshotCreator()->AddData(context, h->Get(lock.v8Isolate));
               }
               KJ_CASE_ONEOF(h, v8::Global<v8::Function>*) {
-                isolateBase.getSnapshotCreator()->AddData(h->Get(lock.v8Isolate));
+                isolateBase.getSnapshotCreator()->AddData(context, h->Get(lock.v8Isolate));
               }
               KJ_CASE_ONEOF(h, v8::Global<v8::Context>*) {
-                isolateBase.getSnapshotCreator()->AddData(h->Get(lock.v8Isolate));
+                // Context already registered via AddContext above.
               }
             }
           }
@@ -2232,7 +2266,17 @@ Worker::Worker(kj::Own<const Script> scriptParam,
           isolateBase.getSnapshotCreator()->SetDefaultContext(context);
           auto blob = isolateBase.getSnapshotCreator()->CreateBlob(
               v8::SnapshotCreator::FunctionCodeHandling::kClear);
-          KJ_DBG("Created snapshot blob!", blob.raw_size, blob.data);
+
+          // Move the V8-owned blob bytes into a kj::Array. v8::StartupData::data is
+          // new[]-allocated; copy it out and delete[] the original. The matching
+          // external_references array (with the 0 terminator we just appended) must travel
+          // with the blob — V8 encodes indices into it inside the snapshot, and a fresh
+          // isolate consuming the blob has to be initialized with the same array.
+          auto bytes =
+              kj::heapArray<kj::byte>(reinterpret_cast<const kj::byte*>(blob.data), blob.raw_size);
+          delete[] blob.data;
+          auto refs = kj::heapArray<intptr_t>(isolateBase.getExternalReferences().asPtr());
+          impl->snapshotArtifact = SnapshotArtifact{kj::mv(bytes), kj::mv(refs)};
         });
 
         KJ_IF_SOME(exp, maybeexp) {
@@ -2241,6 +2285,10 @@ Worker::Worker(kj::Own<const Script> scriptParam,
       }
     });
   });
+}
+
+kj::Maybe<const Worker::SnapshotArtifact&> Worker::getSnapshotArtifact() const {
+  return impl->snapshotArtifact;
 }
 
 Worker::~Worker() noexcept(false) {

@@ -38,6 +38,7 @@ namespace workerd {
 
 WD_STRONG_BOOL(StructuredLogging);
 WD_STRONG_BOOL(ProcessStdioPrefixed);
+WD_STRONG_BOOL(CreateSnapshot);
 
 namespace api {
 class DurableObjectState;
@@ -157,6 +158,17 @@ class Worker: public kj::AtomicRefcounted {
     }
   };
 
+  // The byte blob and matching external_references array produced by the V8
+  // SnapshotCreator inside the Worker ctor when createSnapshot=CreateSnapshot::YES.
+  // Both pieces are needed together: V8 encodes indices into externalRefs inside
+  // the snapshot, so a fresh isolate consuming the blob must be initialized
+  // with an external_references array containing the same callback pointers
+  // in the same order. externalRefs ends with a trailing 0 terminator.
+  struct SnapshotArtifact {
+    kj::Array<kj::byte> blob;
+    kj::Array<intptr_t> externalRefs;
+  };
+
   explicit Worker(kj::Own<const Script> script,
       kj::Own<WorkerObserver> metrics,
       kj::FunctionParam<void(jsg::Lock& lock,
@@ -166,6 +178,7 @@ class Worker: public kj::AtomicRefcounted {
       IsolateObserver::StartType startType,
       SpanParent parentSpan,
       LockType lockType,
+      CreateSnapshot createSnapshot,
       kj::Maybe<ValidationErrorReporter&> errorReporter = kj::none,
       kj::Maybe<kj::Duration&> startupTime = kj::none);
   // `compileBindings()` is a callback that constructs all of the bindings and adds them as
@@ -185,6 +198,11 @@ class Worker: public kj::AtomicRefcounted {
   inline const WorkerObserver& getMetrics() const {
     return *metrics;
   }
+
+  // Returns the V8 startup snapshot bytes and matching external_references
+  // array if this worker was constructed with createSnapshot=CreateSnapshot::YES;
+  // kj::none otherwise. Owned by the Worker.
+  kj::Maybe<const SnapshotArtifact&> getSnapshotArtifact() const;
 
   class Lock;
 
@@ -220,7 +238,19 @@ class Worker: public kj::AtomicRefcounted {
     kj::Maybe<ConsoleFunction> decorator;
   };
 
-  static void setupContext(jsg::Lock& lock,
+  // Phase 1: context setup that is safe to bake into a V8 snapshot
+  // (e.g. WebAssembly.instantiate shim). Called during context creation, both for normal
+  // workers and for the snapshot-creating isolate. Anything that embeds a context-bound
+  // JSFunction in a FunctionTemplate's data must NOT live here — see setupConsoleMethods.
+  static void setupContext(
+      jsg::Lock& lock, v8::Local<v8::Context> context, const LoggingOptions& loggingOptions);
+
+  // Phase 2: runtime-only context setup. Replaces console.{debug,error,info,log,warn} with
+  // logging decorators whose backing FunctionTemplate carries C++ closure data referencing the
+  // original console JSFunction. V8's StartupSerializer rejects JSFunction in the isolate
+  // snapshot, so this MUST run only after the context is fully ready (freshly created or
+  // restored from a snapshot) and never during snapshot save.
+  static void setupConsoleMethods(jsg::Lock& lock,
       v8::Local<v8::Context> context,
       const LoggingOptions& loggingOptions,
       ConsoleMethod* outConsoleMethods);
