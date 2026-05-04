@@ -405,8 +405,7 @@ TestFixture::TestFixture(SetupParams&& params)
           },
           IsolateObserver::StartType::COLD,
           SpanParent(nullptr),
-          Worker::LockType(Worker::Lock::TakeSynchronously(kj::none)),
-          CreateSnapshot::NO)),
+          Worker::LockType(Worker::Lock::TakeSynchronously(kj::none)))),
       errorHandler(kj::heap<DummyErrorHandler>()),
       waitUntilTasks(*errorHandler),
       headerTable(headerTableBuilder.build()) {

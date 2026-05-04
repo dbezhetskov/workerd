@@ -366,30 +366,27 @@ std::unique_ptr<v8::CppHeap> newCppHeap(V8PlatformWrapper* system) {
 //     return v8::Isolate::New(group, params);
 //   });
 // }
-static kj::Own<v8::SnapshotCreator> newSnapshotCreator(
-    v8::Isolate::CreateParams&& params, v8::CppHeap* cppHeap) {
-  return jsg::runInV8Stack([&](jsg::V8StackScope& stackScope) -> decltype(auto) {
-    // We currently don't attempt to support incremental marking or sweeping. We probably could
-    // support them, but it will take some careful investigation and testing. It's not clear if
-    // this would be a win anyway, since Worker heaps are relatively small and therefore doing a
-    // full atomic mark-sweep usually doesn't require much of a pause.
-    //
-    // We probably won't ever support concurrent marking or sweeping because concurrent GC is
-    // only expected to be a win if there are idle CPU cores available. Workers normally run on
-    // servers that are handling many requests at once, thus it's expected CPU cores will be
-    // fully utilized. This differs from browser environments, where a user is typically doing
-    // only one thing at a time and thus likely has CPU cores to spare.
+// Configures the bits of CreateParams shared between NORMAL and SAVE_SNAPSHOT — cpp_heap and
+// the default array_buffer allocator if none was provided.
+//
+// We currently don't attempt to support incremental marking or sweeping. We probably could
+// support them, but it will take some careful investigation and testing. It's not clear if
+// this would be a win anyway, since Worker heaps are relatively small and therefore doing a
+// full atomic mark-sweep usually doesn't require much of a pause.
+//
+// We probably won't ever support concurrent marking or sweeping because concurrent GC is
+// only expected to be a win if there are idle CPU cores available. Workers normally run on
+// servers that are handling many requests at once, thus it's expected CPU cores will be
+// fully utilized. This differs from browser environments, where a user is typically doing
+// only one thing at a time and thus likely has CPU cores to spare.
+static void prepareIsolateParams(v8::Isolate::CreateParams& params, v8::CppHeap* cppHeap) {
+  // V8 takes ownership of the v8::CppHeap.
+  params.cpp_heap = cppHeap;
 
-    // V8 takes ownership of the v8::CppHeap.
-    params.cpp_heap = cppHeap;
-
-    if (params.array_buffer_allocator == nullptr &&
-        params.array_buffer_allocator_shared == nullptr) {
-      params.array_buffer_allocator_shared = std::shared_ptr<v8::ArrayBuffer::Allocator>(
-          v8::ArrayBuffer::Allocator::NewDefaultAllocator());
-    }
-    return kj::heap<v8::SnapshotCreator>(params);
-  });
+  if (params.array_buffer_allocator == nullptr && params.array_buffer_allocator_shared == nullptr) {
+    params.array_buffer_allocator_shared = std::shared_ptr<v8::ArrayBuffer::Allocator>(
+        v8::ArrayBuffer::Allocator::NewDefaultAllocator());
+  }
 }
 }  // namespace
 namespace {
@@ -397,11 +394,46 @@ namespace {
 // due to reallocation. Plenty for ~6.5k callbacks in workerd.
 constexpr size_t kExternalReferencesCapacity = 16384;
 
-v8::Isolate::CreateParams&& wireExternalReferences(
+void wireExternalReferences(
     v8::Isolate::CreateParams& createParams, kj::Vector<intptr_t>& externalReferences) {
   externalReferences.reserve(kExternalReferencesCapacity);
   createParams.external_references = externalReferences.begin();
-  return kj::mv(createParams);
+}
+
+// Mode-specific phase 1: prepare CreateParams and (in SAVE_SNAPSHOT only) build a SnapshotCreator
+// that internally creates the v8::Isolate. Mutates `createParams` in place so phase 2 can read it.
+kj::Maybe<kj::Own<v8::SnapshotCreator>> initSnapshotCreator(IsolateMode mode,
+    v8::Isolate::CreateParams& createParams,
+    v8::CppHeap* cppHeap,
+    kj::Vector<intptr_t>& externalReferences) {
+  return jsg::runInV8Stack([&](jsg::V8StackScope&) -> kj::Maybe<kj::Own<v8::SnapshotCreator>> {
+    switch (mode) {
+      case IsolateMode::NORMAL:
+        prepareIsolateParams(createParams, cppHeap);
+        return kj::none;
+      case IsolateMode::SAVE_SNAPSHOT:
+        wireExternalReferences(createParams, externalReferences);
+        prepareIsolateParams(createParams, cppHeap);
+        return kj::some(kj::heap<v8::SnapshotCreator>(createParams));
+      case IsolateMode::LOAD_SNAPSHOT:
+        KJ_UNIMPLEMENTED("LOAD_SNAPSHOT mode is not yet wired up");
+    }
+    KJ_UNREACHABLE;
+  });
+}
+
+// Mode-specific phase 2: produce the v8::Isolate*. In SAVE_SNAPSHOT we just take it from the
+// already-built SnapshotCreator; in NORMAL we create one from the params phase 1 prepared.
+v8::Isolate* initIsolatePtr(IsolateMode mode,
+    v8::Isolate::CreateParams& createParams,
+    kj::Maybe<kj::Own<v8::SnapshotCreator>>& maybeCreator) {
+  return jsg::runInV8Stack([&](jsg::V8StackScope&) -> v8::Isolate* {
+    KJ_IF_SOME(creator, maybeCreator) {
+      return creator->GetIsolate();
+    }
+    KJ_REQUIRE(mode == IsolateMode::NORMAL);
+    return v8::Isolate::New(createParams);
+  });
 }
 }  // namespace
 
@@ -409,12 +441,14 @@ IsolateBase::IsolateBase(V8System& system,
     v8::Isolate::CreateParams&& createParams,
     kj::Own<IsolateObserver> observer,
     kj::Own<ExternalStringAllocator> externalStringAllocator,
-    v8::IsolateGroup group)
+    v8::IsolateGroup group,
+    IsolateMode mode)
     : v8System(system),
+      mode(mode),
       cppHeap(newCppHeap(const_cast<V8PlatformWrapper*>(system.platformWrapper.get()))),
-      snapshotCreator(newSnapshotCreator(
-          wireExternalReferences(createParams, externalReferences), cppHeap.release())),
-      ptr(snapshotCreator->GetIsolate()),
+      snapshotCreator(
+          initSnapshotCreator(mode, createParams, cppHeap.release(), externalReferences)),
+      ptr(initIsolatePtr(mode, createParams, snapshotCreator)),
       externalMemoryTarget(kj::arc<ExternalMemoryTarget>(ptr)),
       envAsyncContextKey(kj::refcounted<AsyncContextFrame::StorageKey>()),
       exportsAsyncContextKey(kj::refcounted<AsyncContextFrame::StorageKey>()),

@@ -8,6 +8,7 @@
 
 #include <workerd/io/worker-fs.h>
 #include <workerd/io/worker.h>
+#include <workerd/jsg/setup.h>
 #include <workerd/server/workerd.capnp.h>
 
 namespace workerd {
@@ -44,7 +45,8 @@ class WorkerdApi final: public Worker::Api {
       v8::IsolateGroup group,
       kj::Own<JsgIsolateObserver> observer,
       api::MemoryCacheProvider& memoryCacheProvider,
-      const PythonConfig& pythonConfig);
+      const PythonConfig& pythonConfig,
+      jsg::IsolateMode isolateMode = jsg::IsolateMode::NORMAL);
   ~WorkerdApi() noexcept(false);
 
   static const WorkerdApi& from(const Worker::Api&);

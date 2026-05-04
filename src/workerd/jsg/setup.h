@@ -83,6 +83,18 @@ class V8System {
       ShutdownIsolateType);
 };
 
+// Three modes in which an isolate can be created:
+//  * NORMAL: plain `v8::Isolate::New(params)`, no SnapshotCreator. The default.
+//  * SAVE_SNAPSHOT: an isolate constructed via `v8::SnapshotCreator`, which is used later
+//    to serialize a startup snapshot via the save pipeline in worker.c++.
+//  * LOAD_SNAPSHOT: an isolate initialized from a previously-produced snapshot blob.
+//    Not yet implemented; reserved for future work.
+enum class IsolateMode {
+  NORMAL,
+  SAVE_SNAPSHOT,
+  LOAD_SNAPSHOT,
+};
+
 // Base class of Isolate<T> containing parts that don't need to be templated, to avoid code
 // bloat.
 class IsolateBase {
@@ -335,8 +347,15 @@ class IsolateBase {
     return ptr;
   }
 
+  IsolateMode getMode() const {
+    return mode;
+  }
+
+  // Only valid in SAVE_SNAPSHOT mode. Asserts otherwise.
   v8::SnapshotCreator* getSnapshotCreator() {
-    return snapshotCreator.get();
+    return KJ_REQUIRE_NONNULL(
+        snapshotCreator, "getSnapshotCreator() called outside of SAVE_SNAPSHOT mode")
+        .get();
   }
 
   // Visits all persistent handles owned by this isolate and its type wrappers.
@@ -392,15 +411,19 @@ class IsolateBase {
   using Item = kj::OneOf<v8::Global<v8::Data>, RefToDelete, kj::Own<void>>;
 
   V8System& v8System;
+  IsolateMode mode;
   // TODO(cleanup): After v8 13.4 is fully released we can inline this into `newIsolate`
   //                and remove this member.
   std::unique_ptr<class v8::CppHeap> cppHeap;
   // V8 external references. ResourceTypeBuilder pushes callback pointers here as it registers
-  // them with V8 (lazy, on first wrap of each type). Capacity is reserved upfront so the .begin()
-  // pointer we pass to V8 stays stable. Terminating 0 is appended once just before
+  // them with V8 (lazy, on first wrap of each type). In SAVE_SNAPSHOT mode capacity is reserved
+  // upfront so the .begin() pointer we pass to V8 stays stable; in NORMAL mode V8 doesn't see
+  // this vector and the pushes are harmless. Terminating 0 is appended once just before
   // SnapshotCreator::CreateBlob() in worker.c++.
   kj::Vector<intptr_t> externalReferences;
-  kj::Own<v8::SnapshotCreator> snapshotCreator;
+  // Only set in SAVE_SNAPSHOT mode. Owns the SnapshotCreator that owns the V8 isolate referenced
+  // by `ptr`.
+  kj::Maybe<kj::Own<v8::SnapshotCreator>> snapshotCreator;
   v8::Isolate* ptr;
   // When true, evalAllowed is true and switching it to false is a no-op.
   bool alwaysAllowEval = false;
@@ -491,7 +514,8 @@ class IsolateBase {
       v8::Isolate::CreateParams&& createParams,
       kj::Own<IsolateObserver> observer,
       kj::Own<ExternalStringAllocator> externalStringAllocator,
-      v8::IsolateGroup group);
+      v8::IsolateGroup group,
+      IsolateMode mode = IsolateMode::NORMAL);
   ~IsolateBase() noexcept(false);
   KJ_DISALLOW_COPY_AND_MOVE(IsolateBase);
 
@@ -546,7 +570,12 @@ class IsolateBase {
 };
 
 inline void isolateAddExternalReference(v8::Isolate* isolate, intptr_t addr) {
-  auto& refs = IsolateBase::from(isolate).getExternalReferences();
+  auto& base = IsolateBase::from(isolate);
+  // Only collected for snapshot creation. In NORMAL mode V8 does not see the vector and the
+  // pushes would just waste memory; skip them. In LOAD_SNAPSHOT mode the vector is supplied
+  // externally and must not be mutated.
+  if (base.getMode() != IsolateMode::SAVE_SNAPSHOT) return;
+  auto& refs = base.getExternalReferences();
   KJ_DREQUIRE(refs.size() < refs.capacity(),
       "external_references vector grew past reserved capacity; "
       "bump kExternalReferencesCapacity in setup.c++");
@@ -635,12 +664,14 @@ class Isolate: public IsolateBase {
       kj::Own<IsolateObserver> observer,
       kj::Own<ExternalStringAllocator> externalStringAllocator = defaultExternalStringAllocator(),
       v8::Isolate::CreateParams createParams = {},
-      bool instantiateTypeWrapper = true)
+      bool instantiateTypeWrapper = true,
+      IsolateMode mode = IsolateMode::NORMAL)
       : IsolateBase(system,
             kj::mv(createParams),
             kj::mv(observer),
             kj::mv(externalStringAllocator),
-            group) {
+            group,
+            mode) {
     wrappers.resize(1);
     if (instantiateTypeWrapper) {
       instantiateDefaultWrapper(kj::fwd<MetaConfiguration>(configuration));
@@ -654,12 +685,14 @@ class Isolate: public IsolateBase {
       MetaConfiguration&& configuration,
       kj::Own<IsolateObserver> observer,
       v8::Isolate::CreateParams createParams = {},
-      bool instantiateTypeWrapper = true)
+      bool instantiateTypeWrapper = true,
+      IsolateMode mode = IsolateMode::NORMAL)
       : IsolateBase(system,
             kj::mv(createParams),
             kj::mv(observer),
             defaultExternalStringAllocator(),
-            v8::IsolateGroup::Create()) {
+            v8::IsolateGroup::Create(),
+            mode) {
     wrappers.resize(1);
     if (instantiateTypeWrapper) {
       instantiateDefaultWrapper(kj::fwd<MetaConfiguration>(configuration));

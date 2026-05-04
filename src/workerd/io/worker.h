@@ -38,7 +38,6 @@ namespace workerd {
 
 WD_STRONG_BOOL(StructuredLogging);
 WD_STRONG_BOOL(ProcessStdioPrefixed);
-WD_STRONG_BOOL(CreateSnapshot);
 
 namespace api {
 class DurableObjectState;
@@ -159,7 +158,8 @@ class Worker: public kj::AtomicRefcounted {
   };
 
   // The byte blob and matching external_references array produced by the V8
-  // SnapshotCreator inside the Worker ctor when createSnapshot=CreateSnapshot::YES.
+  // SnapshotCreator inside the Worker ctor when the underlying isolate is in
+  // jsg::IsolateMode::SAVE_SNAPSHOT.
   // Both pieces are needed together: V8 encodes indices into externalRefs inside
   // the snapshot, so a fresh isolate consuming the blob must be initialized
   // with an external_references array containing the same callback pointers
@@ -178,7 +178,6 @@ class Worker: public kj::AtomicRefcounted {
       IsolateObserver::StartType startType,
       SpanParent parentSpan,
       LockType lockType,
-      CreateSnapshot createSnapshot,
       kj::Maybe<ValidationErrorReporter&> errorReporter = kj::none,
       kj::Maybe<kj::Duration&> startupTime = kj::none);
   // `compileBindings()` is a callback that constructs all of the bindings and adds them as
@@ -200,7 +199,7 @@ class Worker: public kj::AtomicRefcounted {
   }
 
   // Returns the V8 startup snapshot bytes and matching external_references
-  // array if this worker was constructed with createSnapshot=CreateSnapshot::YES;
+  // array if this worker's isolate was in jsg::IsolateMode::SAVE_SNAPSHOT;
   // kj::none otherwise. Owned by the Worker.
   kj::Maybe<const SnapshotArtifact&> getSnapshotArtifact() const;
 

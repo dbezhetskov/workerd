@@ -276,7 +276,8 @@ struct WorkerdApi::Impl final {
       v8::IsolateGroup group,
       kj::Own<JsgIsolateObserver> observerParam,
       api::MemoryCacheProvider& memoryCacheProvider,
-      const PythonConfig& pythonConfig = defaultConfig)
+      const PythonConfig& pythonConfig = defaultConfig,
+      jsg::IsolateMode isolateMode = jsg::IsolateMode::NORMAL)
       : features(capnp::clone(featuresParam)),
         extensions(extensionsParam),
         observer(kj::atomicAddRef(*observerParam)),
@@ -285,7 +286,9 @@ struct WorkerdApi::Impl final {
             Configuration(*this),
             kj::mv(observerParam),
             jsg::defaultExternalStringAllocator(),
-            kj::mv(createParams)),
+            kj::mv(createParams),
+            /*instantiateTypeWrapper=*/true,
+            isolateMode),
         memoryCacheProvider(memoryCacheProvider),
         pythonConfig(pythonConfig) {
     jsgIsolate.runInLockScope([&](JsgWorkerdIsolate::Lock& lock) {
@@ -310,7 +313,8 @@ WorkerdApi::WorkerdApi(jsg::V8System& v8System,
     v8::IsolateGroup group,
     kj::Own<JsgIsolateObserver> observer,
     api::MemoryCacheProvider& memoryCacheProvider,
-    const PythonConfig& pythonConfig)
+    const PythonConfig& pythonConfig,
+    jsg::IsolateMode isolateMode)
     : impl(kj::heap<Impl>(v8System,
           features,
           extensions,
@@ -318,7 +322,8 @@ WorkerdApi::WorkerdApi(jsg::V8System& v8System,
           group,
           kj::mv(observer),
           memoryCacheProvider,
-          pythonConfig)) {}
+          pythonConfig,
+          isolateMode)) {}
 WorkerdApi::~WorkerdApi() noexcept(false) {}
 
 kj::Own<jsg::Lock> WorkerdApi::lock(jsg::V8StackScope& stackScope) const {

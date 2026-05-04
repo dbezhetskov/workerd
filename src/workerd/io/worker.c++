@@ -541,7 +541,7 @@ struct Worker::Impl {
   // If set, then any attempt to use this worker shall throw this exception.
   kj::Maybe<kj::Exception> permanentException;
 
-  // Populated only when this worker was constructed with createSnapshot=CreateSnapshot::YES.
+  // Populated only when this worker's isolate was in jsg::IsolateMode::SAVE_SNAPSHOT.
   kj::Maybe<SnapshotArtifact> snapshotArtifact;
 };
 
@@ -1849,7 +1849,6 @@ Worker::Worker(kj::Own<const Script> scriptParam,
     IsolateObserver::StartType startType,
     SpanParent parentSpan,
     LockType lockType,
-    CreateSnapshot createSnapshot,
     kj::Maybe<ValidationErrorReporter&> errorReporter,
     kj::Maybe<kj::Duration&> startupTime)
     : script(kj::mv(scriptParam)),
@@ -1933,7 +1932,7 @@ Worker::Worker(kj::Own<const Script> scriptParam,
         // the original console JSFunction, which V8's StartupSerializer rejects in CreateBlob.
         // Must run before user top-level code so the script's first console.log lands on the
         // decorated function. consoleMethods storage lives on Script::Impl (see comment there).
-        if (!createSnapshot) {
+        if (jsg::IsolateBase::from(lock.v8Isolate).getMode() != jsg::IsolateMode::SAVE_SNAPSHOT) {
           // const_cast OK: guarded by isolate lock.
           auto* scriptImpl = const_cast<Worker::Script::Impl*>(script->impl.get());
           recordedLock.setupConsoleMethods(context, scriptImpl->consoleMethods);
@@ -2087,7 +2086,7 @@ Worker::Worker(kj::Own<const Script> scriptParam,
         lock.v8Isolate->SetCaptureStackTraceForUncaughtExceptions(false);
       }
 
-      if (createSnapshot) {
+      if (jsg::IsolateBase::from(lock.v8Isolate).getMode() == jsg::IsolateMode::SAVE_SNAPSHOT) {
         // Creating snapshot.
 
         // Snapshot part 1: Enumerate all persistent handles.
