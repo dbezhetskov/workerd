@@ -1932,7 +1932,7 @@ Worker::Worker(kj::Own<const Script> scriptParam,
         // the original console JSFunction, which V8's StartupSerializer rejects in CreateBlob.
         // Must run before user top-level code so the script's first console.log lands on the
         // decorated function. consoleMethods storage lives on Script::Impl (see comment there).
-        if (jsg::IsolateBase::from(lock.v8Isolate).getMode() != jsg::IsolateMode::SAVE_SNAPSHOT) {
+        if (!jsg::IsolateBase::from(lock.v8Isolate).isSavingSnapshot()) {
           // const_cast OK: guarded by isolate lock.
           auto* scriptImpl = const_cast<Worker::Script::Impl*>(script->impl.get());
           recordedLock.setupConsoleMethods(context, scriptImpl->consoleMethods);
@@ -2003,51 +2003,53 @@ Worker::Worker(kj::Own<const Script> scriptParam,
               KJ_CASE_ONEOF(mainModule, kj::Path) {
                 KJ_IF_SOME(ns,
                     tryResolveMainModule(lock, mainModule, *jsContext, *script, limitErrorOrTime)) {
-                  impl->env = lock.v8Ref(bindingsScope.As<v8::Value>());
-                  impl->ctxExports = lock.v8Ref(ctxExports.As<v8::Value>());
+                  if (!jsg::IsolateBase::from(lock.v8Isolate).isSavingSnapshot()) {
+                    impl->env = lock.v8Ref(bindingsScope.As<v8::Value>());
+                    impl->ctxExports = lock.v8Ref(ctxExports.As<v8::Value>());
 
-                  if (!FeatureFlags::get(js).getDisableImportableEnv()) {
-                    lock.setWorkerExports(lock.v8Ref(ctxExports));
-                  }
+                    if (!FeatureFlags::get(js).getDisableImportableEnv()) {
+                      lock.setWorkerExports(lock.v8Ref(ctxExports));
+                    }
 
-                  auto& api = script->isolate->getApi();
-                  auto handlers = api.unwrapExports(lock, ns);
-                  auto entrypointClasses = api.getEntrypointClasses(lock);
+                    auto& api = script->isolate->getApi();
+                    auto handlers = api.unwrapExports(lock, ns);
+                    auto entrypointClasses = api.getEntrypointClasses(lock);
 
-                  for (auto& handler: handlers.fields) {
-                    KJ_SWITCH_ONEOF(handler.value) {
-                      KJ_CASE_ONEOF(obj, api::ExportedHandler) {
-                        obj.env = lock.v8Ref(bindingsScope.As<v8::Value>());
-                        // Historically, non-class-based handlers reused the same ctx object for all requests.
-                        // This was an accident, but some Workers depend on it.
-                        // Newer worker with the unique_ctx_per_invocation will allocate a new ctx for every request.
-                        obj.ctx = js.alloc<api::ExecutionContext>(lock, jsg::JsValue(ctxExports));
+                    for (auto& handler: handlers.fields) {
+                      KJ_SWITCH_ONEOF(handler.value) {
+                        KJ_CASE_ONEOF(obj, api::ExportedHandler) {
+                          obj.env = lock.v8Ref(bindingsScope.As<v8::Value>());
+                          // Historically, non-class-based handlers reused the same ctx object for all requests.
+                          // This was an accident, but some Workers depend on it.
+                          // Newer worker with the unique_ctx_per_invocation will allocate a new ctx for every request.
+                          obj.ctx = js.alloc<api::ExecutionContext>(lock, jsg::JsValue(ctxExports));
 
-                        // Python Workers append all durable objects, worker entrypoint and workflow
-                        // entrypoint classes in the pythonEntrypoints named export.
-                        bool isPythonWorker = FeatureFlags::get(js).getPythonWorkers();
-                        if (handler.name == "pythonEntrypoints" && isPythonWorker) {
-                          auto handle = obj.self.getHandle(js);
-                          auto dict = js.toDict(handle);
-                          for (auto& field: dict.fields) {
-                            auto unwrapped = api.unwrapExport(lock, field.value);
-                            KJ_SWITCH_ONEOF(unwrapped) {
-                              KJ_CASE_ONEOF(cls, EntrypointClass) {
-                                processEntrypointClass(
-                                    js, kj::mv(cls), entrypointClasses, kj::mv(field.name));
-                              }
-                              KJ_CASE_ONEOF(obj, api::ExportedHandler) {
-                                KJ_FAIL_ASSERT("Expected EntrypointClass");
+                          // Python Workers append all durable objects, worker entrypoint and workflow
+                          // entrypoint classes in the pythonEntrypoints named export.
+                          bool isPythonWorker = FeatureFlags::get(js).getPythonWorkers();
+                          if (handler.name == "pythonEntrypoints" && isPythonWorker) {
+                            auto handle = obj.self.getHandle(js);
+                            auto dict = js.toDict(handle);
+                            for (auto& field: dict.fields) {
+                              auto unwrapped = api.unwrapExport(lock, field.value);
+                              KJ_SWITCH_ONEOF(unwrapped) {
+                                KJ_CASE_ONEOF(cls, EntrypointClass) {
+                                  processEntrypointClass(
+                                      js, kj::mv(cls), entrypointClasses, kj::mv(field.name));
+                                }
+                                KJ_CASE_ONEOF(obj, api::ExportedHandler) {
+                                  KJ_FAIL_ASSERT("Expected EntrypointClass");
+                                }
                               }
                             }
+                          } else {
+                            impl->namedHandlers.insert(kj::mv(handler.name), kj::mv(obj));
                           }
-                        } else {
-                          impl->namedHandlers.insert(kj::mv(handler.name), kj::mv(obj));
                         }
-                      }
-                      KJ_CASE_ONEOF(cls, EntrypointClass) {
-                        processEntrypointClass(
-                            js, kj::mv(cls), entrypointClasses, kj::mv(handler.name));
+                        KJ_CASE_ONEOF(cls, EntrypointClass) {
+                          processEntrypointClass(
+                              js, kj::mv(cls), entrypointClasses, kj::mv(handler.name));
+                        }
                       }
                     }
                   }
@@ -2086,7 +2088,7 @@ Worker::Worker(kj::Own<const Script> scriptParam,
         lock.v8Isolate->SetCaptureStackTraceForUncaughtExceptions(false);
       }
 
-      if (jsg::IsolateBase::from(lock.v8Isolate).getMode() == jsg::IsolateMode::SAVE_SNAPSHOT) {
+      if (jsg::IsolateBase::from(lock.v8Isolate).isSavingSnapshot()) {
         // Creating snapshot.
 
         // Snapshot part 1: Enumerate all persistent handles.
@@ -2106,43 +2108,9 @@ Worker::Worker(kj::Own<const Script> scriptParam,
               [&](v8::Global<v8::DictionaryTemplate>& handle) { activeHandles.add(&handle); });
         }
 
-        {
-          // Worker's handles.
-
-          KJ_IF_SOME(e, impl->env) {
-            e.visitHandle([&](auto& h) { activeHandles.add(&h); });
-          }
-          KJ_IF_SOME(e, impl->ctxExports) {
-            e.visitHandle([&](auto& h) { activeHandles.add(&h); });
-          }
-          KJ_ASSERT(impl->context == kj::none);
-
-          {
-            auto visitExportedFunc = [&](auto& maybeFunc) {
-              KJ_IF_SOME(f, maybeFunc) {
-                f.visitHandlesForSnapshot([&](auto& h) { activeHandles.add(&h); });
-              }
-            };
-            auto visitHandler = [&](api::ExportedHandler& handler) {
-              handler.env.visitHandle([&](auto& h) { activeHandles.add(&h); });
-              handler.self.visitHandle([&](auto& h) { activeHandles.add(&h); });
-              visitExportedFunc(handler.fetch);
-              visitExportedFunc(handler.connect);
-              visitExportedFunc(handler.tail);
-              visitExportedFunc(handler.trace);
-              visitExportedFunc(handler.tailStream);
-              visitExportedFunc(handler.scheduled);
-              visitExportedFunc(handler.alarm);
-              visitExportedFunc(handler.test);
-              visitExportedFunc(handler.webSocketMessage);
-              visitExportedFunc(handler.webSocketClose);
-              visitExportedFunc(handler.webSocketError);
-            };
-            for (auto& entry: impl->namedHandlers) {
-              visitHandler(entry.value);
-            }
-          }
-        }
+        // Worker's per-instance handles (impl->env, impl->ctxExports, impl->namedHandlers)
+        // intentionally not enumerated here: in SAVE_SNAPSHOT mode they are never populated
+        // (see modular path guard above). Snapshot is restricted to isolate/script-level state.
 
         // TODO(dbezhetskov): damn const_cast, why Script is even const unique pointer in the first place?
         auto* scriptImpl = const_cast<Worker::Script::Impl*>(script->impl.get());
@@ -2216,12 +2184,6 @@ Worker::Worker(kj::Own<const Script> scriptParam,
 
           KJ_IF_SOME(moduleContext, scriptImpl->moduleContext) {
             moduleContext->resetHandlesForSnapshot();
-          }
-
-          for (auto& entry: impl->namedHandlers) {
-            KJ_IF_SOME(ctx, entry.value.ctx) {
-              ctx->resetHandlesForSnapshot();
-            }
           }
 
           // Reset module registry handles.

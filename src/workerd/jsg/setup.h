@@ -351,6 +351,14 @@ class IsolateBase {
     return mode;
   }
 
+  bool isSavingSnapshot() const {
+    return mode == IsolateMode::SAVE_SNAPSHOT;
+  }
+
+  bool isLoadingSnapshot() const {
+    return mode == IsolateMode::LOAD_SNAPSHOT;
+  }
+
   // Only valid in SAVE_SNAPSHOT mode. Asserts otherwise.
   v8::SnapshotCreator* getSnapshotCreator() {
     return KJ_REQUIRE_NONNULL(
@@ -574,7 +582,7 @@ inline void isolateAddExternalReference(v8::Isolate* isolate, intptr_t addr) {
   // Only collected for snapshot creation. In NORMAL mode V8 does not see the vector and the
   // pushes would just waste memory; skip them. In LOAD_SNAPSHOT mode the vector is supplied
   // externally and must not be mutated.
-  if (base.getMode() != IsolateMode::SAVE_SNAPSHOT) return;
+  if (!base.isSavingSnapshot()) return;
   auto& refs = base.getExternalReferences();
   KJ_DREQUIRE(refs.size() < refs.capacity(),
       "external_references vector grew past reserved capacity; "
