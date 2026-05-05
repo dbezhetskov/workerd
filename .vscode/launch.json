@@ -164,6 +164,52 @@
       "externalConsole": false
     },
     {
+      "name": "snapshot-test (dbg)",
+      "preLaunchTask": "Bazel build snapshot-test (dbg)",
+      "program": "${workspaceFolder}/bazel-bin/src/workerd/jsg/snapshot-test_binary",
+      "cwd": "${workspaceFolder}",
+      "type": "cppdbg",
+      "request": "launch",
+      "linux": {
+        "type": "cppdbg",
+        "request": "launch",
+        "MIMode": "gdb",
+        "miDebuggerArgs": "-d ${workspaceFolder}"
+      },
+      "osx": {
+        "type": "cppdbg",
+        "request": "launch",
+        "MIMode": "lldb",
+        "sourceFileMap": {
+          "src": "${workspaceFolder}/src",
+          "bazel-bin": "${workspaceFolder}/bazel-bin",
+          "bazel-out": "${workspaceFolder}/bazel-out",
+          "external": "${workspaceFolder}/external"
+        }
+      },
+      "windows": {
+        "type": "cppvsdbg",
+        "request": "launch"
+      },
+      "stopAtEntry": false,
+      "externalConsole": false
+    },
+    {
+      "name": "snapshot-test (dbg, lldb)",
+      "preLaunchTask": "Bazel build snapshot-test (dbg)",
+      "request": "launch",
+      "type": "lldb",
+      "cwd": "${workspaceFolder}",
+      "program": "${workspaceFolder}/bazel-bin/src/workerd/jsg/snapshot-test_binary",
+      "sourceMap": {
+        "src": "${workspaceFolder}/src",
+        "bazel-bin": "${workspaceFolder}/bazel-bin",
+        "bazel-out": "${workspaceFolder}/bazel-out",
+        "external": "${workspaceFolder}/external",
+        "/proc/self/cwd": "${workspaceFolder}"
+      }
+    },
+    {
       "name": "workerd test case (dbg)",
       "preLaunchTask": "Bazel build all (dbg)",
       "program": "${workspaceFolder}/${input:testToDebug}",

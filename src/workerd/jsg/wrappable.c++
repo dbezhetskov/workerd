@@ -327,8 +327,14 @@ void Wrappable::resetHandlesForSnapshot() {
   // Freelist the CppgcShim so that GC triggered by CreateBlob() does not call traceFromV8()
   // with an already-cleared wrapper, which would crash on KJ_ASSERT_NONNULL.
   KJ_IF_SOME(shim, cppgcShim) {
-    HeapTracer::getTracer(isolate).addToFreelist(shim);
+    auto& tracer = HeapTracer::getTracer(isolate);
+    tracer.addToFreelist(shim);
     cppgcShim = kj::none;
+    // Also unlink from the per-isolate wrappers tracking list. Otherwise this Wrappable's
+    // ListLink would still be attached when the C++ object is later destroyed (e.g. when
+    // the owning JsContext / Ref drops in the lock scope), tripping kj::List's
+    // "destroyed object that is still in a kj::List" abort.
+    tracer.removeWrapper({}, *this);
   }
 }
 

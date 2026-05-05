@@ -95,6 +95,14 @@ enum class IsolateMode {
   LOAD_SNAPSHOT,
 };
 
+// In-process LOAD_SNAPSHOT input. Borrows storage from the caller, which must keep both arrays
+// alive for the lifetime of the loaded isolate (V8 retains `external_references` by pointer for
+// the isolate's lifetime; `snapshot_blob` bytes are read during deserialization).
+struct SnapshotArtifact {
+  kj::ArrayPtr<const kj::byte> blob;
+  kj::ArrayPtr<const intptr_t> externalReferences;  // 0-terminated
+};
+
 // Base class of Isolate<T> containing parts that don't need to be templated, to avoid code
 // bloat.
 class IsolateBase {
@@ -429,6 +437,11 @@ class IsolateBase {
   // this vector and the pushes are harmless. Terminating 0 is appended once just before
   // SnapshotCreator::CreateBlob() in worker.c++.
   kj::Vector<intptr_t> externalReferences;
+  // Only used in LOAD_SNAPSHOT mode. Holds {data, raw_size} pointing into the caller-owned blob
+  // bytes. V8 reads `snapshot_blob` during isolate construction and copies its content; the
+  // pointed-to bytes do not need to outlive `Isolate::New`. Declared before `snapshotCreator`
+  // so that `initIsolatePtr` (which captures &snapshotBlobData) sees a constructed object.
+  v8::StartupData snapshotBlobData{nullptr, 0};
   // Only set in SAVE_SNAPSHOT mode. Owns the SnapshotCreator that owns the V8 isolate referenced
   // by `ptr`.
   kj::Maybe<kj::Own<v8::SnapshotCreator>> snapshotCreator;
@@ -523,7 +536,8 @@ class IsolateBase {
       kj::Own<IsolateObserver> observer,
       kj::Own<ExternalStringAllocator> externalStringAllocator,
       v8::IsolateGroup group,
-      IsolateMode mode = IsolateMode::NORMAL);
+      IsolateMode mode = IsolateMode::NORMAL,
+      kj::Maybe<SnapshotArtifact> snapshotArtifact = kj::none);
   ~IsolateBase() noexcept(false);
   KJ_DISALLOW_COPY_AND_MOVE(IsolateBase);
 
@@ -673,13 +687,15 @@ class Isolate: public IsolateBase {
       kj::Own<ExternalStringAllocator> externalStringAllocator = defaultExternalStringAllocator(),
       v8::Isolate::CreateParams createParams = {},
       bool instantiateTypeWrapper = true,
-      IsolateMode mode = IsolateMode::NORMAL)
+      IsolateMode mode = IsolateMode::NORMAL,
+      kj::Maybe<SnapshotArtifact> snapshotArtifact = kj::none)
       : IsolateBase(system,
             kj::mv(createParams),
             kj::mv(observer),
             kj::mv(externalStringAllocator),
             group,
-            mode) {
+            mode,
+            snapshotArtifact) {
     wrappers.resize(1);
     if (instantiateTypeWrapper) {
       instantiateDefaultWrapper(kj::fwd<MetaConfiguration>(configuration));
@@ -694,13 +710,15 @@ class Isolate: public IsolateBase {
       kj::Own<IsolateObserver> observer,
       v8::Isolate::CreateParams createParams = {},
       bool instantiateTypeWrapper = true,
-      IsolateMode mode = IsolateMode::NORMAL)
+      IsolateMode mode = IsolateMode::NORMAL,
+      kj::Maybe<SnapshotArtifact> snapshotArtifact = kj::none)
       : IsolateBase(system,
             kj::mv(createParams),
             kj::mv(observer),
             defaultExternalStringAllocator(),
             v8::IsolateGroup::Create(),
-            mode) {
+            mode,
+            snapshotArtifact) {
     wrappers.resize(1);
     if (instantiateTypeWrapper) {
       instantiateDefaultWrapper(kj::fwd<MetaConfiguration>(configuration));

@@ -60,6 +60,31 @@
       }
     },
     {
+      "label": "Bazel build snapshot-test (dbg)",
+      "type": "shell",
+      "command": "bazel",
+      "args": ["build", "-c", "dbg", "//src/workerd/jsg:snapshot-test_binary"],
+      "osx": {
+        "args": [
+          "build",
+          "-c",
+          "dbg",
+          "--spawn_strategy=local",
+          "//src/workerd/jsg:snapshot-test_binary"
+        ]
+      },
+      "group": "build",
+      "problemMatcher": "$gcc",
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "focus": false,
+        "panel": "shared",
+        "showReuseMessage": false,
+        "clear": false
+      }
+    },
+    {
       "label": "Bazel build workerd (fastbuild)",
       "type": "shell",
       "command": "bazel",

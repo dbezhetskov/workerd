@@ -394,46 +394,50 @@ namespace {
 // due to reallocation. Plenty for ~6.5k callbacks in workerd.
 constexpr size_t kExternalReferencesCapacity = 16384;
 
-void wireExternalReferences(
-    v8::Isolate::CreateParams& createParams, kj::Vector<intptr_t>& externalReferences) {
-  externalReferences.reserve(kExternalReferencesCapacity);
-  createParams.external_references = externalReferences.begin();
-}
-
-// Mode-specific phase 1: prepare CreateParams and (in SAVE_SNAPSHOT only) build a SnapshotCreator
-// that internally creates the v8::Isolate. Mutates `createParams` in place so phase 2 can read it.
+// SAVE_SNAPSHOT-only: wire external_references (V8 retains the pointer for the isolate's
+// lifetime) and build a v8::SnapshotCreator (which internally allocates the isolate). For
+// other modes, returns kj::none. `createParams` must already have `cpp_heap` and the
+// array_buffer_allocator set up by `prepareIsolateParams` (see ctor init list).
 kj::Maybe<kj::Own<v8::SnapshotCreator>> initSnapshotCreator(IsolateMode mode,
     v8::Isolate::CreateParams& createParams,
-    v8::CppHeap* cppHeap,
     kj::Vector<intptr_t>& externalReferences) {
-  return jsg::runInV8Stack([&](jsg::V8StackScope&) -> kj::Maybe<kj::Own<v8::SnapshotCreator>> {
-    switch (mode) {
-      case IsolateMode::NORMAL:
-        prepareIsolateParams(createParams, cppHeap);
-        return kj::none;
-      case IsolateMode::SAVE_SNAPSHOT:
-        wireExternalReferences(createParams, externalReferences);
-        prepareIsolateParams(createParams, cppHeap);
-        return kj::some(kj::heap<v8::SnapshotCreator>(createParams));
-      case IsolateMode::LOAD_SNAPSHOT:
-        KJ_UNIMPLEMENTED("LOAD_SNAPSHOT mode is not yet wired up");
-    }
-    KJ_UNREACHABLE;
+  if (mode != IsolateMode::SAVE_SNAPSHOT) return kj::none;
+
+  externalReferences.reserve(kExternalReferencesCapacity);
+  createParams.external_references = externalReferences.begin();
+
+  return jsg::runInV8Stack([&](jsg::V8StackScope&) -> kj::Own<v8::SnapshotCreator> {
+    return kj::heap<v8::SnapshotCreator>(createParams);
   });
 }
 
-// Mode-specific phase 2: produce the v8::Isolate*. In SAVE_SNAPSHOT we just take it from the
-// already-built SnapshotCreator; in NORMAL we create one from the params phase 1 prepared.
+// Produce the v8::Isolate*.
+//   - SAVE_SNAPSHOT: take the isolate from the SnapshotCreator built earlier.
+//   - LOAD_SNAPSHOT: wire `snapshot_blob` (pointing at the persistent `snapshotBlobData` member)
+//     and `external_references` from the artifact, then `v8::Isolate::New(params)`.
+//   - NORMAL: just `v8::Isolate::New(params)`.
 v8::Isolate* initIsolatePtr(IsolateMode mode,
     v8::Isolate::CreateParams& createParams,
+    v8::StartupData& snapshotBlobData,
+    kj::Maybe<SnapshotArtifact> snapshotArtifact,
     kj::Maybe<kj::Own<v8::SnapshotCreator>>& maybeCreator) {
-  return jsg::runInV8Stack([&](jsg::V8StackScope&) -> v8::Isolate* {
-    KJ_IF_SOME(creator, maybeCreator) {
-      return creator->GetIsolate();
-    }
+  KJ_IF_SOME(creator, maybeCreator) {
+    KJ_REQUIRE(mode == IsolateMode::SAVE_SNAPSHOT);
+    return creator->GetIsolate();
+  }
+
+  if (mode == IsolateMode::LOAD_SNAPSHOT) {
+    auto& artifact =
+        KJ_REQUIRE_NONNULL(snapshotArtifact, "LOAD_SNAPSHOT mode requires a SnapshotArtifact");
+    snapshotBlobData.data = reinterpret_cast<const char*>(artifact.blob.begin());
+    snapshotBlobData.raw_size = static_cast<int>(artifact.blob.size());
+    createParams.snapshot_blob = &snapshotBlobData;
+    createParams.external_references = artifact.externalReferences.begin();
+  } else {
     KJ_REQUIRE(mode == IsolateMode::NORMAL);
-    return v8::Isolate::New(createParams);
-  });
+  }
+
+  return jsg::runInV8Stack([&](jsg::V8StackScope&) { return v8::Isolate::New(createParams); });
 }
 }  // namespace
 
@@ -442,13 +446,17 @@ IsolateBase::IsolateBase(V8System& system,
     kj::Own<IsolateObserver> observer,
     kj::Own<ExternalStringAllocator> externalStringAllocator,
     v8::IsolateGroup group,
-    IsolateMode mode)
+    IsolateMode mode,
+    kj::Maybe<SnapshotArtifact> snapshotArtifact)
     : v8System(system),
       mode(mode),
-      cppHeap(newCppHeap(const_cast<V8PlatformWrapper*>(system.platformWrapper.get()))),
-      snapshotCreator(
-          initSnapshotCreator(mode, createParams, cppHeap.release(), externalReferences)),
-      ptr(initIsolatePtr(mode, createParams, snapshotCreator)),
+      cppHeap([&]() {
+        auto heap = newCppHeap(const_cast<V8PlatformWrapper*>(system.platformWrapper.get()));
+        prepareIsolateParams(createParams, heap.release());
+        return heap;  // empty after release()
+      }()),
+      snapshotCreator(initSnapshotCreator(mode, createParams, externalReferences)),
+      ptr(initIsolatePtr(mode, createParams, snapshotBlobData, snapshotArtifact, snapshotCreator)),
       externalMemoryTarget(kj::arc<ExternalMemoryTarget>(ptr)),
       envAsyncContextKey(kj::refcounted<AsyncContextFrame::StorageKey>()),
       exportsAsyncContextKey(kj::refcounted<AsyncContextFrame::StorageKey>()),
@@ -522,7 +530,15 @@ IsolateBase::~IsolateBase() noexcept(false) {
   jsg::runInV8Stack([&](jsg::V8StackScope& stackScope) {
     // Terminate the v8::platform's task queue associated with this isolate
     v8System.shutdownIsolate(ptr);
-    ptr->Dispose();
+    // In SAVE_SNAPSHOT mode the v8::SnapshotCreator owns the isolate and keeps it
+    // "entered" by the current thread; v8::Isolate::Dispose() refuses to run on an
+    // entered isolate. Destroy the SnapshotCreator first — its destructor exits and
+    // disposes the isolate — and skip ptr->Dispose() in that case.
+    if (snapshotCreator != kj::none) {
+      snapshotCreator = kj::none;
+    } else {
+      ptr->Dispose();
+    }
     ptr = nullptr;
     // TODO(cleanup): meaningless after V8 13.4 is released.
     cppHeap.reset();
