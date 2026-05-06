@@ -98,13 +98,13 @@ KJ_TEST("save and load V8 snapshot round-trip in same process") {
   }  // saveIsolate destroyed
 
   // === LOAD phase ===
-  kj::Maybe<SnapshotArtifact> maybeArtifact = SnapshotArtifact{
-    .blob = blobBytes.asPtr(),
-    .externalReferences = refs.asPtr(),
+  SnapshotArtifact artifact{
+    .blob = kj::mv(blobBytes),
+    .externalReferences = kj::mv(refs),
   };
   SnapIsolate loadIsolate(v8System, v8::IsolateGroup::GetDefault(), nullptr,
       kj::heap<IsolateObserver>(), defaultExternalStringAllocator(), v8::Isolate::CreateParams{},
-      /*instantiateTypeWrapper=*/true, IsolateMode::LOAD_SNAPSHOT, maybeArtifact);
+      /*instantiateTypeWrapper=*/true, IsolateMode::LOAD_SNAPSHOT, artifact);
 
   loadIsolate.runInLockScope([&](SnapIsolate::Lock& lock) {
     jsg::Lock& js = lock;

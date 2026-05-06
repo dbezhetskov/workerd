@@ -542,7 +542,8 @@ struct Worker::Impl {
   kj::Maybe<kj::Exception> permanentException;
 
   // Populated only when this worker's isolate was in jsg::IsolateMode::SAVE_SNAPSHOT.
-  kj::Maybe<SnapshotArtifact> snapshotArtifact;
+  // Moved out by Worker::getSnapshotArtifact().
+  kj::Maybe<jsg::SnapshotArtifact> snapshotArtifact;
 };
 
 // Note that Isolate mutable state is protected by locking the JsgWorkerIsolate unless otherwise
@@ -1987,23 +1988,49 @@ Worker::Worker(kj::Own<const Script> scriptParam,
             js.setAllowEval(FeatureFlags::get(js).getAllowEvalDuringStartup());
             KJ_DEFER(js.setAllowEval(false));
 
+            auto& isolateBase = jsg::IsolateBase::from(lock.v8Isolate);
+            const bool isSavingSnapshot = isolateBase.isSavingSnapshot();
+            const bool isLoadingSnapshot = isolateBase.isLoadingSnapshot();
+
             KJ_SWITCH_ONEOF(script->impl->unboundScriptOrMainModule) {
               KJ_CASE_ONEOF(unboundScript, jsg::NonModuleScript) {
-                auto limitScope =
-                    script->isolate->getLimitEnforcer().enterStartupJs(lock, limitErrorOrTime);
-                unboundScript.run(lock);
-                // Flush microtasks enqueued during top-level script evaluation.
-                // Without this flush, microtasks (e.g. promise continuations from async
-                // initialization) remain on the per-isolate microtask queue and can leak across
-                // V8 contexts when multiple Workers share an isolate (same script, different
-                // zones). The leaked microtasks then execute under the wrong IoContext, making
-                // things go boom.
-                lock.runMicrotasks();
+                if (!isLoadingSnapshot) {
+                  auto limitScope =
+                      script->isolate->getLimitEnforcer().enterStartupJs(lock, limitErrorOrTime);
+                  unboundScript.run(lock);
+                  // Flush microtasks enqueued during top-level script evaluation.
+                  // Without this flush, microtasks (e.g. promise continuations from async
+                  // initialization) remain on the per-isolate microtask queue and can leak across
+                  // V8 contexts when multiple Workers share an isolate (same script, different
+                  // zones). The leaked microtasks then execute under the wrong IoContext, making
+                  // things go boom.
+                  lock.runMicrotasks();
+                }
               }
               KJ_CASE_ONEOF(mainModule, kj::Path) {
-                KJ_IF_SOME(ns,
-                    tryResolveMainModule(lock, mainModule, *jsContext, *script, limitErrorOrTime)) {
-                  if (!jsg::IsolateBase::from(lock.v8Isolate).isSavingSnapshot()) {
+                kj::Maybe<v8::Local<v8::Object>> maybeNs;
+                if (isLoadingSnapshot) {
+                  // Recover module namespace from snapshot. Index 0 is reserved for the namespace
+                  // by the matching SAVE_SNAPSHOT path below.
+                  v8::Local<v8::Object> ns;
+                  KJ_REQUIRE(context->GetDataFromSnapshotOnce<v8::Object>(0).ToLocal(&ns),
+                      "LOAD_SNAPSHOT: module namespace missing from snapshot at index 0");
+                  maybeNs = ns;
+                } else {
+                  maybeNs =
+                      tryResolveMainModule(lock, mainModule, *jsContext, *script, limitErrorOrTime);
+                }
+
+                KJ_IF_SOME(ns, maybeNs) {
+                  if (isSavingSnapshot) {
+                    // Save module namespace at snapshot index 0. This must be the FIRST
+                    // AddData call against the SnapshotCreator — the LOAD path retrieves
+                    // it via GetDataFromSnapshotOnce<v8::Object>(0). The SAVE block at the
+                    // end of this Worker ctor performs all subsequent AddData calls.
+                    auto idx = isolateBase.getSnapshotCreator()->AddData(context, ns);
+                    KJ_REQUIRE(idx == 0, "module namespace must be the first AddData entry", idx);
+                  }
+                  if (!isSavingSnapshot) {
                     impl->env = lock.v8Ref(bindingsScope.As<v8::Value>());
                     impl->ctxExports = lock.v8Ref(ctxExports.As<v8::Value>());
 
@@ -2237,7 +2264,10 @@ Worker::Worker(kj::Own<const Script> scriptParam,
               kj::heapArray<kj::byte>(reinterpret_cast<const kj::byte*>(blob.data), blob.raw_size);
           delete[] blob.data;
           auto refs = kj::heapArray<intptr_t>(isolateBase.getExternalReferences().asPtr());
-          impl->snapshotArtifact = SnapshotArtifact{kj::mv(bytes), kj::mv(refs)};
+          impl->snapshotArtifact = jsg::SnapshotArtifact{
+            .blob = kj::mv(bytes),
+            .externalReferences = kj::mv(refs),
+          };
         });
 
         KJ_IF_SOME(exp, maybeexp) {
@@ -2248,8 +2278,8 @@ Worker::Worker(kj::Own<const Script> scriptParam,
   });
 }
 
-kj::Maybe<const Worker::SnapshotArtifact&> Worker::getSnapshotArtifact() const {
-  return impl->snapshotArtifact;
+kj::Maybe<jsg::SnapshotArtifact> Worker::getSnapshotArtifact() {
+  return kj::mv(impl->snapshotArtifact);
 }
 
 Worker::~Worker() noexcept(false) {

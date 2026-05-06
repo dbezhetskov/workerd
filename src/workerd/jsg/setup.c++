@@ -419,7 +419,7 @@ kj::Maybe<kj::Own<v8::SnapshotCreator>> initSnapshotCreator(IsolateMode mode,
 v8::Isolate* initIsolatePtr(IsolateMode mode,
     v8::Isolate::CreateParams& createParams,
     v8::StartupData& snapshotBlobData,
-    kj::Maybe<SnapshotArtifact> snapshotArtifact,
+    kj::Maybe<const SnapshotArtifact&> snapshotArtifact,
     kj::Maybe<kj::Own<v8::SnapshotCreator>>& maybeCreator) {
   KJ_IF_SOME(creator, maybeCreator) {
     KJ_REQUIRE(mode == IsolateMode::SAVE_SNAPSHOT);
@@ -447,7 +447,7 @@ IsolateBase::IsolateBase(V8System& system,
     kj::Own<ExternalStringAllocator> externalStringAllocator,
     v8::IsolateGroup group,
     IsolateMode mode,
-    kj::Maybe<SnapshotArtifact> snapshotArtifact)
+    kj::Maybe<const SnapshotArtifact&> snapshotArtifact)
     : v8System(system),
       mode(mode),
       cppHeap([&]() {

@@ -34,6 +34,10 @@ class BackingStore;
 class Isolate;
 }  // namespace v8
 
+namespace workerd::jsg {
+struct SnapshotArtifact;
+}  // namespace workerd::jsg
+
 namespace workerd {
 
 WD_STRONG_BOOL(StructuredLogging);
@@ -157,18 +161,6 @@ class Worker: public kj::AtomicRefcounted {
     }
   };
 
-  // The byte blob and matching external_references array produced by the V8
-  // SnapshotCreator inside the Worker ctor when the underlying isolate is in
-  // jsg::IsolateMode::SAVE_SNAPSHOT.
-  // Both pieces are needed together: V8 encodes indices into externalRefs inside
-  // the snapshot, so a fresh isolate consuming the blob must be initialized
-  // with an external_references array containing the same callback pointers
-  // in the same order. externalRefs ends with a trailing 0 terminator.
-  struct SnapshotArtifact {
-    kj::Array<kj::byte> blob;
-    kj::Array<intptr_t> externalRefs;
-  };
-
   explicit Worker(kj::Own<const Script> script,
       kj::Own<WorkerObserver> metrics,
       kj::FunctionParam<void(jsg::Lock& lock,
@@ -198,10 +190,10 @@ class Worker: public kj::AtomicRefcounted {
     return *metrics;
   }
 
-  // Returns the V8 startup snapshot bytes and matching external_references
-  // array if this worker's isolate was in jsg::IsolateMode::SAVE_SNAPSHOT;
-  // kj::none otherwise. Owned by the Worker.
-  kj::Maybe<const SnapshotArtifact&> getSnapshotArtifact() const;
+  // Returns the snapshot produced when this worker's isolate ran in
+  // jsg::IsolateMode::SAVE_SNAPSHOT (or kj::none). Ownership is transferred to the caller;
+  // subsequent calls return kj::none.
+  kj::Maybe<jsg::SnapshotArtifact> getSnapshotArtifact();
 
   class Lock;
 

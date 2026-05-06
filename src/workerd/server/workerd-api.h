@@ -46,7 +46,8 @@ class WorkerdApi final: public Worker::Api {
       kj::Own<JsgIsolateObserver> observer,
       api::MemoryCacheProvider& memoryCacheProvider,
       const PythonConfig& pythonConfig,
-      jsg::IsolateMode isolateMode = jsg::IsolateMode::NORMAL);
+      jsg::IsolateMode isolateMode = jsg::IsolateMode::NORMAL,
+      kj::Maybe<const jsg::SnapshotArtifact&> snapshotArtifact = kj::none);
   ~WorkerdApi() noexcept(false);
 
   static const WorkerdApi& from(const Worker::Api&);

@@ -95,12 +95,16 @@ enum class IsolateMode {
   LOAD_SNAPSHOT,
 };
 
-// In-process LOAD_SNAPSHOT input. Borrows storage from the caller, which must keep both arrays
-// alive for the lifetime of the loaded isolate (V8 retains `external_references` by pointer for
-// the isolate's lifetime; `snapshot_blob` bytes are read during deserialization).
+// V8 startup snapshot bytes paired with the matching external_references array.
+// Both pieces are needed together: V8 encodes indices into externalReferences inside the
+// snapshot, so a fresh isolate consuming the blob must be initialized with an external_references
+// array containing the same callback pointers in the same order. externalReferences ends with a
+// trailing 0 terminator. The owner must keep this alive for the lifetime of any isolate loaded
+// from it (V8 retains the external_references pointer; snapshot_blob bytes are read during
+// deserialization).
 struct SnapshotArtifact {
-  kj::ArrayPtr<const kj::byte> blob;
-  kj::ArrayPtr<const intptr_t> externalReferences;  // 0-terminated
+  kj::Array<kj::byte> blob;
+  kj::Array<intptr_t> externalReferences;
 };
 
 // Base class of Isolate<T> containing parts that don't need to be templated, to avoid code
@@ -537,7 +541,7 @@ class IsolateBase {
       kj::Own<ExternalStringAllocator> externalStringAllocator,
       v8::IsolateGroup group,
       IsolateMode mode = IsolateMode::NORMAL,
-      kj::Maybe<SnapshotArtifact> snapshotArtifact = kj::none);
+      kj::Maybe<const SnapshotArtifact&> snapshotArtifact = kj::none);
   ~IsolateBase() noexcept(false);
   KJ_DISALLOW_COPY_AND_MOVE(IsolateBase);
 
@@ -688,7 +692,7 @@ class Isolate: public IsolateBase {
       v8::Isolate::CreateParams createParams = {},
       bool instantiateTypeWrapper = true,
       IsolateMode mode = IsolateMode::NORMAL,
-      kj::Maybe<SnapshotArtifact> snapshotArtifact = kj::none)
+      kj::Maybe<const SnapshotArtifact&> snapshotArtifact = kj::none)
       : IsolateBase(system,
             kj::mv(createParams),
             kj::mv(observer),
@@ -711,7 +715,7 @@ class Isolate: public IsolateBase {
       v8::Isolate::CreateParams createParams = {},
       bool instantiateTypeWrapper = true,
       IsolateMode mode = IsolateMode::NORMAL,
-      kj::Maybe<SnapshotArtifact> snapshotArtifact = kj::none)
+      kj::Maybe<const SnapshotArtifact&> snapshotArtifact = kj::none)
       : IsolateBase(system,
             kj::mv(createParams),
             kj::mv(observer),
