@@ -86,6 +86,14 @@ using kj::uint;
 class GcVisitor;
 class HeapTracer;
 
+// Payload returned by Wrappable::snapshotSerialize(). Defined at namespace scope so
+// subclasses of jsg::Object (which inherits Wrappable privately) can name the type
+// without going through the inaccessible Wrappable:: scope.
+struct SnapshotData {
+  uint32_t typeId;
+  kj::Array<kj::byte> bytes;
+};
+
 // Base class for C++ objects which can be "wrapped" for JavaScript consumption. A JavaScript
 // "wrapper" object is created, and then the JS wrapper and C++ Wrappable are "attached" to each
 // other via attachWrapper().
@@ -147,6 +155,17 @@ class Wrappable: public kj::Refcounted {
   // Also freelists the CppgcShim so that GC triggered by CreateBlob() does not call traceFromV8()
   // when wrapper is already cleared (which would crash on KJ_ASSERT_NONNULL).
   void resetHandlesForSnapshot();
+
+  // Override in subclasses that want to survive a V8 startup snapshot. Default returns
+  // kj::none, meaning the wrapper's internal fields will be serialized as empty payloads
+  // and the C++ side will not be reconstructed on load. Called from a
+  // SerializeInternalFieldsCallback while V8 walks the default context graph.
+  //
+  // `typeId` is a caller-defined discriminator written into the snapshot blob and used
+  // by the deserialize side to dispatch to a factory.
+  virtual kj::Maybe<SnapshotData> snapshotSerialize() {
+    return kj::none;
+  }
 
   // Called by jsg::Ref<T> to ensure that its Wrappable is destroyed under the isolate lock.
   // `ownSelf` keeps the raw `self` pointer valid -- they are passed separately because Wrappable is

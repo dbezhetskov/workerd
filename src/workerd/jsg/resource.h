@@ -1927,6 +1927,14 @@ struct NewContextOptions {
   kj::Maybe<const ModuleRegistryBase&> newModuleRegistry = kj::none;
   kj::Maybe<const capnp::SchemaLoader&> schemaLoader = kj::none;
   bool enableWeakRef = false;
+  // Threaded through to v8::Context::New() in newContext below. Required when loading
+  // from a startup snapshot whose default context contains aligned-pointer internal
+  // fields or aligned-pointer embedder data slots that need the embedder to reattach
+  // C++ state. V8 fails CheckEq on the global object's map size if a snapshot-loading
+  // Context::New is called without a matching deserializer for non-empty fields.
+  v8::DeserializeInternalFieldsCallback internalFieldsDeserializer;
+  v8::DeserializeContextDataCallback contextDataDeserializer;
+  v8::DeserializeAPIWrapperCallback apiWrapperDeserializer = v8::DeserializeAPIWrapperCallback();
 };
 
 // TypeWrapper mixin for resource types (application-defined C++ classes declared with a
@@ -2058,7 +2066,10 @@ class ResourceWrapper {
 
     auto isolate = js.v8Isolate;
     auto tmpl = getTemplate<true>(isolate, nullptr)->InstanceTemplate();
-    v8::Local<v8::Context> context = v8::Context::New(isolate, nullptr, tmpl);
+    v8::Local<v8::Context> context = v8::Context::New(isolate, /*extensions=*/nullptr, tmpl,
+        /*global_object=*/v8::MaybeLocal<v8::Value>(), options.internalFieldsDeserializer,
+        /*microtask_queue=*/nullptr, options.contextDataDeserializer,
+        options.apiWrapperDeserializer);
     auto global = context->Global();
 
     auto ptr = js.alloc<T>(kj::fwd<Args>(args)...);
