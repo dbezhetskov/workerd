@@ -651,18 +651,13 @@ struct Worker::Isolate::Impl {
     }
     KJ_DISALLOW_COPY_AND_MOVE(Lock);
 
-    void setupContext(v8::Local<v8::Context> context) {
+    void setupContext(v8::Local<v8::Context> context, Worker::ConsoleMethod* outConsoleMethods) {
       // The V8Inspector implements the `console` object.
       KJ_IF_SOME(i, impl.inspector) {
         i.get()->contextCreated(
             v8_inspector::V8ContextInfo(context, 1, jsg::toInspectorStringView("Worker")));
       }
-      Worker::setupContext(*lock, context, loggingOptions);
-    }
-
-    void setupConsoleMethods(
-        v8::Local<v8::Context> context, Worker::ConsoleMethod* outConsoleMethods) {
-      Worker::setupConsoleMethods(*lock, context, loggingOptions, outConsoleMethods);
+      Worker::setupContext(*lock, context, loggingOptions, outConsoleMethods);
     }
 
     void disposeContext(jsg::JsContext<api::ServiceWorkerGlobalScope> context) {
@@ -1413,7 +1408,7 @@ Worker::Script::Script(kj::Own<const Isolate> isolateParam,
             }));
         mContext->enableWarningOnSpecialEvents();
         context = mContext.getHandle(lock);
-        recordedLock.setupContext(context);
+        recordedLock.setupContext(context, impl->consoleMethods);
       } else {
         // Although we're going to compile a script independent of context, V8 requires that
         // there be an active context, otherwise it will segfault, I guess. So we create a
@@ -1737,12 +1732,10 @@ void shimWebAssemblyInstantiate(jsg::Lock& lock, v8::Local<v8::Context> context)
       jsg::JsFunction(registerFn), jsg::JsObject(webAssembly));
 }
 
-void Worker::setupContext(
-    jsg::Lock& lock, v8::Local<v8::Context> context, const LoggingOptions& loggingOptions) {
-  // Phase 1: only context setup that is safe to bake into a V8 snapshot.
-  // (void)loggingOptions kept for ABI parity with setupConsoleMethods, but unused here today.)
-  (void)loggingOptions;
-
+void Worker::setupContext(jsg::Lock& lock,
+    v8::Local<v8::Context> context,
+    const LoggingOptions& loggingOptions,
+    Worker::ConsoleMethod* outConsoleMethods) {
   // Set WebAssembly.Module @@HasInstance
   //setWebAssemblyModuleHasInstance(lock, context);  SnapshotCreator's isolate doesn't have access to WebAssembly
 
@@ -1750,17 +1743,12 @@ void Worker::setupContext(
   if (util::Autogate::isEnabled(util::AutogateKey::WASM_SHUTDOWN_SIGNAL_SHIM)) {
     shimWebAssemblyInstantiate(lock, context);
   }
-}
 
-void Worker::setupConsoleMethods(jsg::Lock& lock,
-    v8::Local<v8::Context> context,
-    const LoggingOptions& loggingOptions,
-    Worker::ConsoleMethod* outConsoleMethods) {
-  // Phase 2: replace V8's default console.log(), etc. with logging decorators.
-  // MUST NOT run during snapshot save: wrapSimpleFunction creates a FunctionTemplate whose
-  // `data` holds a C++ closure (a JSObject reachable from the FunctionTemplateInfo) that in
-  // turn references the original console JSFunction. V8's StartupSerializer rejects
-  // JSFunction reachable from the isolate snapshot.
+  // Replace V8's default console.log(), etc. with logging decorators.
+  // TODO(snapshots): wrapSimpleFunction creates a FunctionTemplate whose `data` holds a C++
+  // closure (a JSObject reachable from the FunctionTemplateInfo) that in turn references the
+  // original console JSFunction. V8's StartupSerializer rejects JSFunction reachable from the
+  // isolate snapshot, so the SAVE_SNAPSHOT pipeline needs a snapshot-safe decoration path.
   auto global = context->Global();
   auto consoleStr = jsg::v8StrIntern(lock.v8Isolate, "console");
   auto console = jsg::check(global->Get(context, consoleStr)).As<v8::Object>();
@@ -1916,7 +1904,9 @@ Worker::Worker(kj::Own<const Script> scriptParam,
       script->installVirtualFileSystemOnContext(context);
 
       if (!script->modular) {
-        recordedLock.setupContext(context);
+        // const_cast OK: guarded by isolate lock.
+        auto* scriptImpl = const_cast<Worker::Script::Impl*>(script->impl.get());
+        recordedLock.setupContext(context, scriptImpl->consoleMethods);
       }
 
       if (script->impl->unboundScriptOrMainModule == nullptr) {
@@ -1928,17 +1918,6 @@ Worker::Worker(kj::Own<const Script> scriptParam,
 
       // Enter the context for compiling and running the script.
       JSG_WITHIN_CONTEXT_SCOPE(lock, context, [&](jsg::Lock& js) {
-        // Phase 2 of context setup, runtime-only. Skipped for blueprint workers because
-        // the decorator's FunctionTemplate carries a JSObject in its `data` slot referencing
-        // the original console JSFunction, which V8's StartupSerializer rejects in CreateBlob.
-        // Must run before user top-level code so the script's first console.log lands on the
-        // decorated function. consoleMethods storage lives on Script::Impl (see comment there).
-        if (!jsg::IsolateBase::from(lock.v8Isolate).isSavingSnapshot()) {
-          // const_cast OK: guarded by isolate lock.
-          auto* scriptImpl = const_cast<Worker::Script::Impl*>(script->impl.get());
-          recordedLock.setupConsoleMethods(context, scriptImpl->consoleMethods);
-        }
-
         v8::TryCatch catcher(lock.v8Isolate);
         ExceptionOrDuration limitErrorOrTime = 0 * kj::NANOSECONDS;
 

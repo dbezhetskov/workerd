@@ -229,19 +229,15 @@ class Worker: public kj::AtomicRefcounted {
     kj::Maybe<ConsoleFunction> decorator;
   };
 
-  // Phase 1: context setup that is safe to bake into a V8 snapshot
-  // (e.g. WebAssembly.instantiate shim). Called during context creation, both for normal
-  // workers and for the snapshot-creating isolate. Anything that embeds a context-bound
-  // JSFunction in a FunctionTemplate's data must NOT live here — see setupConsoleMethods.
-  static void setupContext(
-      jsg::Lock& lock, v8::Local<v8::Context> context, const LoggingOptions& loggingOptions);
-
-  // Phase 2: runtime-only context setup. Replaces console.{debug,error,info,log,warn} with
-  // logging decorators whose backing FunctionTemplate carries C++ closure data referencing the
-  // original console JSFunction. V8's StartupSerializer rejects JSFunction in the isolate
-  // snapshot, so this MUST run only after the context is fully ready (freshly created or
-  // restored from a snapshot) and never during snapshot save.
-  static void setupConsoleMethods(jsg::Lock& lock,
+  // Context setup invoked once per V8 context, for all isolate modes (normal, save-snapshot,
+  // load-snapshot). Installs the WebAssembly.instantiate shim and replaces
+  // console.{debug,error,info,log,warn} with logging decorators. Originals and decorators are
+  // written into `outConsoleMethods` so the snapshot-save pipeline can enumerate them.
+  // TODO(snapshots): the decorator's FunctionTemplate carries C++ closure data referencing the
+  // original console JSFunction, which V8's StartupSerializer rejects in CreateBlob — the
+  // SAVE_SNAPSHOT pipeline needs a snapshot-safe decoration path before this can be used as-is
+  // in that mode.
+  static void setupContext(jsg::Lock& lock,
       v8::Local<v8::Context> context,
       const LoggingOptions& loggingOptions,
       ConsoleMethod* outConsoleMethods);
