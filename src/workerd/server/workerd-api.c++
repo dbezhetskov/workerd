@@ -342,6 +342,9 @@ jsg::JsContext<api::ServiceWorkerGlobalScope> WorkerdApi::newContext(
     .newModuleRegistry = options.newModuleRegistry,
     .schemaLoader = options.schemaLoader,
     .enableWeakRef = getFeatureFlags().getJsWeakRef(),
+    .internalFieldsDeserializer = options.internalFieldsDeserializer,
+    .contextDataDeserializer = options.contextDataDeserializer,
+    .apiWrapperDeserializer = options.apiWrapperDeserializer,
   };
   return kj::downcast<JsgWorkerdIsolate::Lock>(lock).newContext<api::ServiceWorkerGlobalScope>(
       kj::mv(opts));

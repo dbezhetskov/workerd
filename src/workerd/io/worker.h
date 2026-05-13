@@ -639,11 +639,18 @@ class Worker::Api {
     // install on the newly created context. If null, the old system is assumed.
     kj::Maybe<const workerd::jsg::modules::ModuleRegistry&> newModuleRegistry;
     kj::Maybe<const capnp::SchemaLoader&> schemaLoader;
+
+    // Threaded through to v8::Context::New() inside the JSG layer. Required when loading a
+    // startup snapshot whose default context carries aligned-pointer internal fields that
+    // the embedder needs to reattach C++ state to (e.g. native-backed jsg::Function wrappers).
+    v8::DeserializeInternalFieldsCallback internalFieldsDeserializer;
+    v8::DeserializeContextDataCallback contextDataDeserializer;
+    v8::DeserializeAPIWrapperCallback apiWrapperDeserializer;
   };
 
   // Create the context (global scope) object.
   virtual jsg::JsContext<api::ServiceWorkerGlobalScope> newContext(
-      jsg::Lock& lock, NewContextOptions options = {}) const = 0;
+      jsg::Lock& lock, NewContextOptions options) const = 0;
 
   virtual void compileModules(jsg::Lock& lock,
       const Script::ModulesSource& source,

@@ -14,6 +14,7 @@
 
 #include <v8-context.h>
 #include <v8-function.h>
+#include <v8-object.h>
 
 #include <kj/function.h>
 
@@ -24,6 +25,16 @@ class WrappableFunction;
 
 class WrappableFunctionBase: public Wrappable {
  public:
+  // 'JSCF' — JSG cpp function. Marks the wrapper as a native-backed jsg::Function so the
+  // SerializeInternalFieldsCallback emits a non-empty payload; on LOAD the deserialize
+  // callback writes nullptr into the Wrappable* slot and the embedder reattaches a fresh
+  // Wrappable to the holder.
+  static constexpr uint32_t kSnapshotTypeId = 0x4a534346;
+
+  kj::Maybe<SnapshotData> snapshotSerialize() override {
+    return SnapshotData{.typeId = kSnapshotTypeId, .bytes = kj::heapArray<kj::byte>(0)};
+  }
+
   kj::StringPtr jsgGetMemoryName() const override {
     return "WrappableFunction"_kjc;
   }
@@ -218,6 +229,24 @@ class Function<Ret(Args...)> {
       }
       KJ_CASE_ONEOF(js, JsImpl) {}
     }
+  }
+
+  // SAVE: handle of the lazily-attached opaque wrapper object (set by wrapSimpleFunction).
+  // kj::none for JS-backed functions or native-backed functions without an attached wrapper.
+  kj::Maybe<v8::Local<v8::Object>> tryGetNativeWrapperHandle(v8::Isolate* isolate) {
+    KJ_IF_SOME(native, impl.template tryGet<Ref<NativeFunction>>()) {
+      return native->tryGetHandle(isolate);
+    }
+    return kj::none;
+  }
+
+  // LOAD: attach `holder` (the v8::Object V8 restored from the snapshot) as the C++ wrapper
+  // for this native-backed function. Used after constructing a fresh jsg::Function around a
+  // C++ functor to rebind it to an existing holder produced by DeserializeInternalFieldsCallback.
+  void attachWrapperForSnapshot(v8::Isolate* isolate, v8::Local<v8::Object> holder) {
+    auto& native = KJ_ASSERT_NONNULL(impl.template tryGet<Ref<NativeFunction>>(),
+        "attachWrapperForSnapshot called on JS-backed Function");
+    native->attachWrapper(isolate, holder, native->needsGcTracing);
   }
 
   inline void visitForGc(GcVisitor& visitor) {

@@ -36,6 +36,7 @@
 #include <rust/jsg/ffi.h>
 #include <v8-inspector.h>
 #include <v8-profiler.h>
+#include <v8-snapshot.h>
 #include <v8-wasm.h>
 
 #include <capnp/compat/json.h>
@@ -510,6 +511,85 @@ static thread_local const Worker::Api* currentApi = nullptr;
 
 // Number of console methods wrapped by setupContext (debug, error, info, log, warn).
 static constexpr size_t kConsoleOriginalsCount = 5;
+
+// Snapshot internal-fields callback header: 4-byte big-endian typeId followed by raw bytes.
+static constexpr size_t kSnapshotHeaderBytes = 4;
+
+static void writeBE32(kj::byte* dst, uint32_t value) {
+  dst[0] = static_cast<kj::byte>((value >> 24) & 0xff);
+  dst[1] = static_cast<kj::byte>((value >> 16) & 0xff);
+  dst[2] = static_cast<kj::byte>((value >> 8) & 0xff);
+  dst[3] = static_cast<kj::byte>(value & 0xff);
+}
+
+static uint32_t readBE32(const char* src) {
+  auto* p = reinterpret_cast<const unsigned char*>(src);
+  return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
+}
+
+// SerializeInternalFieldsCallback. Called by V8 during CreateBlob() for every aligned
+// pointer internal field of every reachable v8::Object in the default context. Generic:
+// walks the WORKERD_WRAPPABLE_TAG, virtually calls wrappable->snapshotSerialize(), and
+// emits the standard header + payload layout.
+static v8::StartupData workerSerializeInternalFieldsCb(
+    v8::Local<v8::Object> holder, int index, void* /*data*/) {
+  if (index == jsg::Wrappable::WRAPPABLE_TAG_FIELD_INDEX) {
+    return {nullptr, 0};
+  }
+  KJ_REQUIRE(index == jsg::Wrappable::WRAPPED_OBJECT_FIELD_INDEX);
+  if (!jsg::Wrappable::isWorkerdApiObject(holder)) {
+    return {nullptr, 0};
+  }
+  auto* wrappable = static_cast<jsg::Wrappable*>(
+      holder->GetAlignedPointerFromInternalField(jsg::Wrappable::WRAPPED_OBJECT_FIELD_INDEX,
+          static_cast<v8::EmbedderDataTypeTag>(jsg::Wrappable::WRAPPED_OBJECT_FIELD_INDEX)));
+  if (wrappable == nullptr) {
+    return {nullptr, 0};
+  }
+  KJ_IF_SOME(payload, wrappable->snapshotSerialize()) {
+    size_t total = kSnapshotHeaderBytes + payload.bytes.size();
+    // V8 takes ownership of the returned buffer and frees it via delete[].
+    char* buf = new char[total];
+    writeBE32(reinterpret_cast<kj::byte*>(buf), payload.typeId);
+    if (payload.bytes.size() > 0) {
+      memcpy(buf + kSnapshotHeaderBytes, payload.bytes.begin(), payload.bytes.size());
+    }
+    return v8::StartupData{buf, static_cast<int>(total)};
+  }
+  return {nullptr, 0};
+}
+
+static v8::StartupData workerSerializeContextDataStub(v8::Local<v8::Context>, int, void*) {
+  return {nullptr, 0};
+}
+
+static v8::StartupData workerSerializeApiWrapperStub(v8::Local<v8::Object>, void*, void*) {
+  return {nullptr, 0};
+}
+
+// DeserializeInternalFieldsCallback. Called by V8 inside Context::New() while restoring the
+// default context graph. For workerd Wrappable wrappers we restore the WORKERD_WRAPPABLE_TAG
+// and pin the Wrappable* slot to nullptr — the actual C++ object is reattached later by the
+// embedder (see Worker::setupContext LOAD branch for console decorators).
+static void workerDeserializeInternalFieldsCb(
+    v8::Local<v8::Object> holder, int index, v8::StartupData payload, void* /*data*/) {
+  if (index == jsg::Wrappable::WRAPPABLE_TAG_FIELD_INDEX) {
+    auto* tagPtr = const_cast<uint16_t*>(&jsg::Wrappable::WORKERD_WRAPPABLE_TAG);
+    holder->SetAlignedPointerInInternalField(jsg::Wrappable::WRAPPABLE_TAG_FIELD_INDEX, tagPtr,
+        static_cast<v8::EmbedderDataTypeTag>(jsg::Wrappable::WRAPPABLE_TAG_FIELD_INDEX));
+    return;
+  }
+  KJ_REQUIRE(index == jsg::Wrappable::WRAPPED_OBJECT_FIELD_INDEX);
+  if (payload.raw_size < static_cast<int>(kSnapshotHeaderBytes)) {
+    return;
+  }
+  uint32_t typeId = readBE32(payload.data);
+  if (typeId != jsg::WrappableFunctionBase::kSnapshotTypeId) {
+    return;
+  }
+  holder->SetAlignedPointerInInternalField(jsg::Wrappable::WRAPPED_OBJECT_FIELD_INDEX, nullptr,
+      static_cast<v8::EmbedderDataTypeTag>(jsg::Wrappable::WRAPPED_OBJECT_FIELD_INDEX));
+}
 
 const Worker::Api& Worker::Api::current() {
   KJ_REQUIRE(currentApi != nullptr, "not running JavaScript");
@@ -1401,11 +1481,15 @@ Worker::Script::Script(kj::Own<const Isolate> isolateParam,
       v8::Local<v8::Context> context;
       if (modular) {
         // Modules can't be compiled for multiple contexts. We need to create the real context now.
-        auto& mContext = impl->moduleContext.emplace(isolate->getApi().newContext(lock,
-            {
-              .newModuleRegistry = impl->getNewModuleRegistry(),
-              .schemaLoader = getSchemaLoader(),
-            }));
+        Worker::Api::NewContextOptions newCtxOpts;
+        newCtxOpts.newModuleRegistry = impl->getNewModuleRegistry();
+        newCtxOpts.schemaLoader = getSchemaLoader();
+        if (jsg::IsolateBase::from(lock.v8Isolate).isLoadingSnapshot()) {
+          newCtxOpts.internalFieldsDeserializer =
+              v8::DeserializeInternalFieldsCallback(&workerDeserializeInternalFieldsCb, nullptr);
+        }
+        auto& mContext =
+            impl->moduleContext.emplace(isolate->getApi().newContext(lock, kj::mv(newCtxOpts)));
         mContext->enableWarningOnSpecialEvents();
         context = mContext.getHandle(lock);
         recordedLock.setupContext(context, impl->consoleMethods);
@@ -1744,14 +1828,73 @@ void Worker::setupContext(jsg::Lock& lock,
     shimWebAssemblyInstantiate(lock, context);
   }
 
-  // Replace V8's default console.log(), etc. with logging decorators.
-  // TODO(snapshots): wrapSimpleFunction creates a FunctionTemplate whose `data` holds a C++
-  // closure (a JSObject reachable from the FunctionTemplateInfo) that in turn references the
-  // original console JSFunction. V8's StartupSerializer rejects JSFunction reachable from the
-  // isolate snapshot, so the SAVE_SNAPSHOT pipeline needs a snapshot-safe decoration path.
+  constexpr LogLevel kLevels[kConsoleOriginalsCount] = {
+    LogLevel::DEBUG_,
+    LogLevel::ERROR,
+    LogLevel::INFO,
+    LogLevel::LOG,
+    LogLevel::WARN,
+  };
+  constexpr const char* kMethodNames[kConsoleOriginalsCount] = {
+    "debug",
+    "error",
+    "info",
+    "log",
+    "warn",
+  };
+
   auto global = context->Global();
   auto consoleStr = jsg::v8StrIntern(lock.v8Isolate, "console");
   auto console = jsg::check(global->Get(context, consoleStr)).As<v8::Object>();
+
+  // LOAD branch: rebind freshly-constructed decorator Wrappables to the holders V8 restored
+  // from the snapshot. Originals (indices 1..5) and decorator wrappers (indices 6..10) live
+  // at the known AddData positions established by the SAVE block.
+  if (jsg::IsolateBase::from(lock.v8Isolate).isLoadingSnapshot()) {
+    for (size_t i = 0; i < kConsoleOriginalsCount; ++i) {
+      v8::Local<v8::Function> fn;
+      KJ_REQUIRE(context->GetDataFromSnapshotOnce<v8::Function>(i + 1).ToLocal(&fn),
+          "LOAD_SNAPSHOT: console original missing at snapshot index", i + 1);
+      outConsoleMethods[i].original.Reset(lock.v8Isolate, fn);
+    }
+
+    for (size_t i = 0; i < kConsoleOriginalsCount; ++i) {
+      auto& slot = outConsoleMethods[i];
+      v8::Local<v8::Object> holder;
+      KJ_REQUIRE(context->GetDataFromSnapshotOnce<v8::Object>(i + 1 + kConsoleOriginalsCount)
+                     .ToLocal(&holder),
+          "LOAD_SNAPSHOT: decorator wrapper missing at snapshot index",
+          i + 1 + kConsoleOriginalsCount);
+
+      auto level = kLevels[i];
+      Worker::ConsoleFunction handler = [loggingOptions, level, original = &slot.original](
+                                            jsg::Lock& js,
+                                            const v8::FunctionCallbackInfo<v8::Value>& info) {
+        handleLog(js, loggingOptions, level, *original, info);
+      };
+      Worker::ConsoleFunction decorator(kj::mv(handler));
+      // Mount a fresh Wrappable on the snapshot-restored holder. The deserialize callback left
+      // internal field 1 as nullptr; attachWrapper sets it to this WrappableFunction.
+      decorator.attachWrapperForSnapshot(lock.v8Isolate, holder);
+      // Save a Ref<NativeFunction> on Script::Impl before wrapSimpleFunction consumes the
+      // Function via kj::mv.
+      slot.decorator = decorator.addRef(lock.v8Isolate);
+      // wrapSimpleFunction sees the already-attached holder via ref->tryGetHandle and calls
+      // v8::Function::New(context, FunctorCallback::callback, holder), reusing the restored
+      // holder. On LOAD this v8::Function creation is harmless — the snapshot is already done.
+      auto f = lock.wrapSimpleFunction(context, kj::mv(decorator));
+      auto methodStr = jsg::v8StrIntern(lock.v8Isolate, kMethodNames[i]);
+      jsg::check(console->Set(context, methodStr, f));
+    }
+    return;
+  }
+
+  // Replace V8's default console.log(), etc. with logging decorators.
+  // TODO(snapshots): wrapSimpleFunction creates a FunctionTemplate whose `data` holds a C++
+  // closure (a JSObject reachable from the FunctionTemplateInfo) that in turn references the
+  // original console JSFunction. V8's StartupSerializer accepts this only because the
+  // SerializeInternalFieldsCallback above emits a recognised payload for it; on LOAD the
+  // decorator is rebuilt via the LOAD branch above.
 
   size_t idx = 0;
   auto setHandler = [&](const char* method, LogLevel level) {
@@ -1770,11 +1913,9 @@ void Worker::setupContext(jsg::Lock& lock,
     jsg::check(console->Set(context, methodStr, f));
   };
 
-  setHandler("debug", LogLevel::DEBUG_);
-  setHandler("error", LogLevel::ERROR);
-  setHandler("info", LogLevel::INFO);
-  setHandler("log", LogLevel::LOG);
-  setHandler("warn", LogLevel::WARN);
+  for (size_t i = 0; i < kConsoleOriginalsCount; ++i) {
+    setHandler(kMethodNames[i], kLevels[i]);
+  }
 }
 // =======================================================================================
 
@@ -1883,11 +2024,15 @@ Worker::Worker(kj::Own<const Script> scriptParam,
         currentSpan.setTag("module_context"_kjc, true);
       } else {
         // Create a new context.
-        jsContext = &this->impl->context.emplace(script->isolate->getApi().newContext(lock,
-            {
-              .newModuleRegistry = script->impl->getNewModuleRegistry(),
-              .schemaLoader = script->getSchemaLoader(),
-            }));
+        Worker::Api::NewContextOptions newCtxOpts;
+        newCtxOpts.newModuleRegistry = script->impl->getNewModuleRegistry();
+        newCtxOpts.schemaLoader = script->getSchemaLoader();
+        if (jsg::IsolateBase::from(lock.v8Isolate).isLoadingSnapshot()) {
+          newCtxOpts.internalFieldsDeserializer =
+              v8::DeserializeInternalFieldsCallback(&workerDeserializeInternalFieldsCb, nullptr);
+        }
+        jsContext = &this->impl->context.emplace(
+            script->isolate->getApi().newContext(lock, kj::mv(newCtxOpts)));
       }
 
       v8::Local<v8::Context> context = KJ_REQUIRE_NONNULL(jsContext).getHandle(lock);
@@ -2130,21 +2275,38 @@ Worker::Worker(kj::Own<const Script> scriptParam,
           }
 
           KJ_ASSERT(scriptImpl->globals.size() == 0);
-
-          // For modular (ESM) workers, console originals are stored in Script::Impl because
-          // setupContext() runs during Script construction (not Worker construction).
-          for (auto& m: scriptImpl->consoleMethods) {
-            if (!m.original.IsEmpty()) {
-              activeHandles.add(&m.original);
-            }
-          }
         }
 
         auto maybeexp = kj::runCatchingExceptions([&]() {
           jsg::Lock& js = lock;
           jsg::IsolateBase& isolateBase = jsg::IsolateBase::from(js.v8Isolate);
 
-          // Snapshot part 2: Preserve js objects in the snapshot.
+          // Snapshot part 2a: Pin console originals at fixed snapshot indices 1..5 (after the
+          // module namespace at index 0) and decorator wrappers at indices 6..10. The LOAD
+          // side pulls them via GetDataFromSnapshotOnce<v8::Function>(i+1) and
+          // GetDataFromSnapshotOnce<v8::Object>(i+1+kConsoleOriginalsCount) from
+          // Worker::setupContext.
+          for (size_t i = 0; i < kConsoleOriginalsCount; ++i) {
+            auto& m = scriptImpl->consoleMethods[i];
+            KJ_REQUIRE(!m.original.IsEmpty(),
+                "console original must be populated before snapshot save", i);
+            auto idx =
+                isolateBase.getSnapshotCreator()->AddData(context, m.original.Get(lock.v8Isolate));
+            KJ_REQUIRE(idx == i + 1, "console original index drift", idx, i);
+          }
+
+          for (size_t i = 0; i < kConsoleOriginalsCount; ++i) {
+            auto& m = scriptImpl->consoleMethods[i];
+            auto& dec =
+                KJ_REQUIRE_NONNULL(m.decorator, "decorator missing before snapshot save", i);
+            auto wrapperHandle = KJ_REQUIRE_NONNULL(dec.tryGetNativeWrapperHandle(lock.v8Isolate),
+                "decorator wrapper missing — wrapSimpleFunction should have allocated it", i);
+            auto idx = isolateBase.getSnapshotCreator()->AddData(context, wrapperHandle);
+            KJ_REQUIRE(idx == i + 1 + kConsoleOriginalsCount,
+                "console decorator wrapper index drift", idx, i);
+          }
+
+          // Snapshot part 2b: Preserve js objects in the snapshot.
           for (auto& handle: activeHandles) {
             KJ_SWITCH_ONEOF(handle) {
               KJ_CASE_ONEOF(h, v8::Global<v8::FunctionTemplate>*) {
@@ -2225,12 +2387,44 @@ Worker::Worker(kj::Own<const Script> scriptParam,
             }
           }
 
+          // Detach decorators from console.{method} so the decorated v8::Function (and the
+          // SFI/FTI V8 created inside Function::New) become JS-unreachable. The wrapper holder
+          // JSObject itself stays alive in the context snapshot via the AddData(context, holder)
+          // calls above. Without this, StartupSerializer walks FTI → data → holder → holder.map
+          // → ... → Object JSFunction inside CreateBlob and trips its "JSFunctions belong in
+          // context snapshot" invariant. On LOAD setupContext rebuilds decorators around the
+          // restored holders and re-installs them on console.
+          {
+            constexpr const char* kMethodNames[kConsoleOriginalsCount] = {
+              "debug",
+              "error",
+              "info",
+              "log",
+              "warn",
+            };
+            auto global = context->Global();
+            auto consoleStr = jsg::v8StrIntern(lock.v8Isolate, "console");
+            auto consoleObj = jsg::check(global->Get(context, consoleStr)).As<v8::Object>();
+            for (size_t i = 0; i < kConsoleOriginalsCount; ++i) {
+              auto& m = scriptImpl->consoleMethods[i];
+              KJ_REQUIRE(!m.original.IsEmpty(),
+                  "console original must be populated before SAVE undecorate", i);
+              auto methodStr = jsg::v8StrIntern(lock.v8Isolate, kMethodNames[i]);
+              jsg::check(consoleObj->Set(context, methodStr, m.original.Get(lock.v8Isolate)));
+            }
+          }
+
           // Snapshot part 4: Create snapshot blob.
           // Terminate the V8 external_references array. ResourceTypeBuilder has been pushing
           // callback pointers into IsolateBase::externalReferences as types were wrapped during
           // worker setup; V8 reads up to the trailing 0 inside CreateBlob().
           isolateBase.getExternalReferences().add(0);
-          isolateBase.getSnapshotCreator()->SetDefaultContext(context);
+          v8::SerializeInternalFieldsCallback serializeCb(
+              &workerSerializeInternalFieldsCb, nullptr);
+          v8::SerializeContextDataCallback contextDataCb(&workerSerializeContextDataStub, nullptr);
+          v8::SerializeAPIWrapperCallback apiWrapperCb(&workerSerializeApiWrapperStub, nullptr);
+          isolateBase.getSnapshotCreator()->SetDefaultContext(
+              context, serializeCb, contextDataCb, apiWrapperCb);
           auto blob = isolateBase.getSnapshotCreator()->CreateBlob(
               v8::SnapshotCreator::FunctionCodeHandling::kClear);
 

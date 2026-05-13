@@ -55,7 +55,7 @@ class WorkerdApi final: public Worker::Api {
   kj::Own<jsg::Lock> lock(jsg::V8StackScope& stackScope) const override;
   CompatibilityFlags::Reader getFeatureFlags() const override;
   jsg::JsContext<api::ServiceWorkerGlobalScope> newContext(
-      jsg::Lock& lock, Worker::Api::NewContextOptions options = {}) const override;
+      jsg::Lock& lock, Worker::Api::NewContextOptions options) const override;
   jsg::Dict<NamedExport> unwrapExports(
       jsg::Lock& lock, v8::Local<v8::Value> moduleNamespace) const override;
   NamedExport unwrapExport(jsg::Lock& lock, v8::Local<v8::Value> exportVal) const override;
