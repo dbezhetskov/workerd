@@ -570,7 +570,7 @@ static v8::StartupData workerSerializeApiWrapperStub(v8::Local<v8::Object>, void
 // DeserializeInternalFieldsCallback. Called by V8 inside Context::New() while restoring the
 // default context graph. For workerd Wrappable wrappers we restore the WORKERD_WRAPPABLE_TAG
 // and pin the Wrappable* slot to nullptr — the actual C++ object is reattached later by the
-// embedder (see Worker::setupContext LOAD branch for console decorators).
+// embedder (see Worker::setupContext START_FROM_SNAPSHOT branch for console decorators).
 static void workerDeserializeInternalFieldsCb(
     v8::Local<v8::Object> holder, int index, v8::StartupData payload, void* /*data*/) {
   if (index == jsg::Wrappable::WRAPPABLE_TAG_FIELD_INDEX) {
@@ -621,7 +621,7 @@ struct Worker::Impl {
   // If set, then any attempt to use this worker shall throw this exception.
   kj::Maybe<kj::Exception> permanentException;
 
-  // Populated only when this worker's isolate was in jsg::IsolateMode::SAVE_SNAPSHOT.
+  // Populated only when this worker's isolate was in jsg::IsolateMode::PREPARE_SNAPSHOT.
   // Moved out by Worker::getSnapshotArtifact().
   kj::Maybe<jsg::SnapshotArtifact> snapshotArtifact;
 };
@@ -1484,7 +1484,7 @@ Worker::Script::Script(kj::Own<const Isolate> isolateParam,
         Worker::Api::NewContextOptions newCtxOpts;
         newCtxOpts.newModuleRegistry = impl->getNewModuleRegistry();
         newCtxOpts.schemaLoader = getSchemaLoader();
-        if (jsg::IsolateBase::from(lock.v8Isolate).isLoadingSnapshot()) {
+        if (jsg::IsolateBase::from(lock.v8Isolate).isStartingFromSnapshot()) {
           newCtxOpts.internalFieldsDeserializer =
               v8::DeserializeInternalFieldsCallback(&workerDeserializeInternalFieldsCb, nullptr);
         }
@@ -1847,14 +1847,14 @@ void Worker::setupContext(jsg::Lock& lock,
   auto consoleStr = jsg::v8StrIntern(lock.v8Isolate, "console");
   auto console = jsg::check(global->Get(context, consoleStr)).As<v8::Object>();
 
-  // LOAD branch: rebind freshly-constructed decorator Wrappables to the holders V8 restored
-  // from the snapshot. Originals (indices 1..5) and decorator wrappers (indices 6..10) live
-  // at the known AddData positions established by the SAVE block.
-  if (jsg::IsolateBase::from(lock.v8Isolate).isLoadingSnapshot()) {
+  // START_FROM_SNAPSHOT branch: rebind freshly-constructed decorator Wrappables to the holders
+  // V8 restored from the snapshot. Originals (indices 1..5) and decorator wrappers
+  // (indices 6..10) live at the known AddData positions established by the PREPARE_SNAPSHOT block.
+  if (jsg::IsolateBase::from(lock.v8Isolate).isStartingFromSnapshot()) {
     for (size_t i = 0; i < kConsoleOriginalsCount; ++i) {
       v8::Local<v8::Function> fn;
       KJ_REQUIRE(context->GetDataFromSnapshotOnce<v8::Function>(i + 1).ToLocal(&fn),
-          "LOAD_SNAPSHOT: console original missing at snapshot index", i + 1);
+          "START_FROM_SNAPSHOT: console original missing at snapshot index", i + 1);
       outConsoleMethods[i].original.Reset(lock.v8Isolate, fn);
     }
 
@@ -1863,7 +1863,7 @@ void Worker::setupContext(jsg::Lock& lock,
       v8::Local<v8::Object> holder;
       KJ_REQUIRE(context->GetDataFromSnapshotOnce<v8::Object>(i + 1 + kConsoleOriginalsCount)
                      .ToLocal(&holder),
-          "LOAD_SNAPSHOT: decorator wrapper missing at snapshot index",
+          "START_FROM_SNAPSHOT: decorator wrapper missing at snapshot index",
           i + 1 + kConsoleOriginalsCount);
 
       auto level = kLevels[i];
@@ -1893,8 +1893,8 @@ void Worker::setupContext(jsg::Lock& lock,
   // TODO(snapshots): wrapSimpleFunction creates a FunctionTemplate whose `data` holds a C++
   // closure (a JSObject reachable from the FunctionTemplateInfo) that in turn references the
   // original console JSFunction. V8's StartupSerializer accepts this only because the
-  // SerializeInternalFieldsCallback above emits a recognised payload for it; on LOAD the
-  // decorator is rebuilt via the LOAD branch above.
+  // SerializeInternalFieldsCallback above emits a recognised payload for it; on
+  // START_FROM_SNAPSHOT the decorator is rebuilt via the START_FROM_SNAPSHOT branch above.
 
   size_t idx = 0;
   auto setHandler = [&](const char* method, LogLevel level) {
@@ -2027,7 +2027,7 @@ Worker::Worker(kj::Own<const Script> scriptParam,
         Worker::Api::NewContextOptions newCtxOpts;
         newCtxOpts.newModuleRegistry = script->impl->getNewModuleRegistry();
         newCtxOpts.schemaLoader = script->getSchemaLoader();
-        if (jsg::IsolateBase::from(lock.v8Isolate).isLoadingSnapshot()) {
+        if (jsg::IsolateBase::from(lock.v8Isolate).isStartingFromSnapshot()) {
           newCtxOpts.internalFieldsDeserializer =
               v8::DeserializeInternalFieldsCallback(&workerDeserializeInternalFieldsCb, nullptr);
         }
@@ -2113,12 +2113,12 @@ Worker::Worker(kj::Own<const Script> scriptParam,
             KJ_DEFER(js.setAllowEval(false));
 
             auto& isolateBase = jsg::IsolateBase::from(lock.v8Isolate);
-            const bool isSavingSnapshot = isolateBase.isSavingSnapshot();
-            const bool isLoadingSnapshot = isolateBase.isLoadingSnapshot();
+            const bool isPreparingSnapshot = isolateBase.isPreparingSnapshot();
+            const bool isStartingFromSnapshot = isolateBase.isStartingFromSnapshot();
 
             KJ_SWITCH_ONEOF(script->impl->unboundScriptOrMainModule) {
               KJ_CASE_ONEOF(unboundScript, jsg::NonModuleScript) {
-                if (!isLoadingSnapshot) {
+                if (!isStartingFromSnapshot) {
                   auto limitScope =
                       script->isolate->getLimitEnforcer().enterStartupJs(lock, limitErrorOrTime);
                   unboundScript.run(lock);
@@ -2133,12 +2133,12 @@ Worker::Worker(kj::Own<const Script> scriptParam,
               }
               KJ_CASE_ONEOF(mainModule, kj::Path) {
                 kj::Maybe<v8::Local<v8::Object>> maybeNs;
-                if (isLoadingSnapshot) {
+                if (isStartingFromSnapshot) {
                   // Recover module namespace from snapshot. Index 0 is reserved for the namespace
-                  // by the matching SAVE_SNAPSHOT path below.
+                  // by the matching PREPARE_SNAPSHOT path below.
                   v8::Local<v8::Object> ns;
                   KJ_REQUIRE(context->GetDataFromSnapshotOnce<v8::Object>(0).ToLocal(&ns),
-                      "LOAD_SNAPSHOT: module namespace missing from snapshot at index 0");
+                      "START_FROM_SNAPSHOT: module namespace missing from snapshot at index 0");
                   maybeNs = ns;
                 } else {
                   maybeNs =
@@ -2146,15 +2146,16 @@ Worker::Worker(kj::Own<const Script> scriptParam,
                 }
 
                 KJ_IF_SOME(ns, maybeNs) {
-                  if (isSavingSnapshot) {
+                  if (isPreparingSnapshot) {
                     // Save module namespace at snapshot index 0. This must be the FIRST
-                    // AddData call against the SnapshotCreator — the LOAD path retrieves
-                    // it via GetDataFromSnapshotOnce<v8::Object>(0). The SAVE block at the
+                    // AddData call against the SnapshotCreator — the START_FROM_SNAPSHOT path
+                    // retrieves it via GetDataFromSnapshotOnce<v8::Object>(0). The
+                    // PREPARE_SNAPSHOT block at the
                     // end of this Worker ctor performs all subsequent AddData calls.
                     auto idx = isolateBase.getSnapshotCreator()->AddData(context, ns);
                     KJ_REQUIRE(idx == 0, "module namespace must be the first AddData entry", idx);
                   }
-                  if (!isSavingSnapshot) {
+                  if (!isPreparingSnapshot) {
                     impl->env = lock.v8Ref(bindingsScope.As<v8::Value>());
                     impl->ctxExports = lock.v8Ref(ctxExports.As<v8::Value>());
 
@@ -2239,7 +2240,7 @@ Worker::Worker(kj::Own<const Script> scriptParam,
         lock.v8Isolate->SetCaptureStackTraceForUncaughtExceptions(false);
       }
 
-      if (jsg::IsolateBase::from(lock.v8Isolate).isSavingSnapshot()) {
+      if (jsg::IsolateBase::from(lock.v8Isolate).isPreparingSnapshot()) {
         // Creating snapshot.
 
         // Snapshot part 1: Enumerate all persistent handles.
@@ -2260,7 +2261,7 @@ Worker::Worker(kj::Own<const Script> scriptParam,
         }
 
         // Worker's per-instance handles (impl->env, impl->ctxExports, impl->namedHandlers)
-        // intentionally not enumerated here: in SAVE_SNAPSHOT mode they are never populated
+        // intentionally not enumerated here: in PREPARE_SNAPSHOT mode they are never populated
         // (see modular path guard above). Snapshot is restricted to isolate/script-level state.
 
         // TODO(dbezhetskov): damn const_cast, why Script is even const unique pointer in the first place?
@@ -2289,7 +2290,7 @@ Worker::Worker(kj::Own<const Script> scriptParam,
           for (size_t i = 0; i < kConsoleOriginalsCount; ++i) {
             auto& m = scriptImpl->consoleMethods[i];
             KJ_REQUIRE(!m.original.IsEmpty(),
-                "console original must be populated before snapshot save", i);
+                "console original must be populated before snapshot serialization", i);
             auto idx =
                 isolateBase.getSnapshotCreator()->AddData(context, m.original.Get(lock.v8Isolate));
             KJ_REQUIRE(idx == i + 1, "console original index drift", idx, i);
@@ -2297,8 +2298,8 @@ Worker::Worker(kj::Own<const Script> scriptParam,
 
           for (size_t i = 0; i < kConsoleOriginalsCount; ++i) {
             auto& m = scriptImpl->consoleMethods[i];
-            auto& dec =
-                KJ_REQUIRE_NONNULL(m.decorator, "decorator missing before snapshot save", i);
+            auto& dec = KJ_REQUIRE_NONNULL(
+                m.decorator, "decorator missing before snapshot serialization", i);
             auto wrapperHandle = KJ_REQUIRE_NONNULL(dec.tryGetNativeWrapperHandle(lock.v8Isolate),
                 "decorator wrapper missing — wrapSimpleFunction should have allocated it", i);
             auto idx = isolateBase.getSnapshotCreator()->AddData(context, wrapperHandle);

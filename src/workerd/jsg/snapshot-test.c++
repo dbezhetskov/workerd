@@ -2,7 +2,7 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 //
-// PoC: validate that an in-process V8 snapshot save→load round-trip works at the JSG layer,
+// PoC: validate that an in-process V8 snapshot prepare→start round-trip works at the JSG layer,
 // including a C++-wrapped object with internal fields that survives the snapshot via
 // SerializeInternalFieldsCallback / DeserializeInternalFieldsCallback.
 
@@ -167,11 +167,11 @@ KJ_TEST("save and load V8 snapshot round-trip in same process") {
   kj::Array<kj::byte> blobBytes;
   kj::Array<intptr_t> refs;
 
-  // === SAVE phase ===
+  // === PREPARE_SNAPSHOT phase ===
   {
-    SnapIsolate saveIsolate(v8System, v8::IsolateGroup::GetDefault(), nullptr,
+    SnapIsolate prepareIsolate(v8System, v8::IsolateGroup::GetDefault(), nullptr,
         kj::heap<IsolateObserver>(), defaultExternalStringAllocator(), v8::Isolate::CreateParams{},
-        /*instantiateTypeWrapper=*/true, IsolateMode::SAVE_SNAPSHOT);
+        /*instantiateTypeWrapper=*/true, IsolateMode::PREPARE_SNAPSHOT);
 
     // Holds a strong refcount on every C++ Wrappable that opted into snapshot
     // serialization, keeping them alive across CreateBlob() so the serialize callback
@@ -181,7 +181,7 @@ KJ_TEST("save and load V8 snapshot round-trip in same process") {
     // keepalives are what keep the C++ side alive after that teardown.
     kj::Vector<kj::Own<Wrappable>> snapshotKeepalives;
 
-    saveIsolate.runInLockScope([&](SnapIsolate::Lock& lock) {
+    prepareIsolate.runInLockScope([&](SnapIsolate::Lock& lock) {
       jsg::Lock& js = lock;
       js.withinHandleScope([&] {
         auto jsContext = lock.newContext<SnapCtx>();
@@ -220,9 +220,9 @@ KJ_TEST("save and load V8 snapshot round-trip in same process") {
           snapshotKeepalives.add(wrappable->detachWrapper(/*shouldFreelistShim=*/true));
         }
 
-        // Save pipeline at JSG layer: only isolate-level handles (visited via
+        // PREPARE_SNAPSHOT pipeline at JSG layer: only isolate-level handles (visited via
         // IsolateBase::visitPersistentHandles), no Worker handles.
-        auto& base = static_cast<IsolateBase&>(saveIsolate);
+        auto& base = static_cast<IsolateBase&>(prepareIsolate);
         kj::Vector<v8::Global<v8::FunctionTemplate>*> ftHandles;
         kj::Vector<v8::Global<v8::Object>*> objHandles;
         kj::Vector<v8::Global<v8::Name>*> nameHandles;
@@ -274,18 +274,18 @@ KJ_TEST("save and load V8 snapshot round-trip in same process") {
         refs = kj::heapArray<intptr_t>(base.getExternalReferences().asPtr());
       });
     });
-  }  // saveIsolate destroyed
+  }  // prepareIsolate destroyed
 
-  // === LOAD phase ===
+  // === START_FROM_SNAPSHOT phase ===
   SnapshotArtifact artifact{
     .blob = kj::mv(blobBytes),
     .externalReferences = kj::mv(refs),
   };
-  SnapIsolate loadIsolate(v8System, v8::IsolateGroup::GetDefault(), nullptr,
+  SnapIsolate startIsolate(v8System, v8::IsolateGroup::GetDefault(), nullptr,
       kj::heap<IsolateObserver>(), defaultExternalStringAllocator(), v8::Isolate::CreateParams{},
-      /*instantiateTypeWrapper=*/true, IsolateMode::LOAD_SNAPSHOT, artifact);
+      /*instantiateTypeWrapper=*/true, IsolateMode::START_FROM_SNAPSHOT, artifact);
 
-  loadIsolate.runInLockScope([&](SnapIsolate::Lock& lock) {
+  startIsolate.runInLockScope([&](SnapIsolate::Lock& lock) {
     jsg::Lock& js = lock;
     js.withinHandleScope([&] {
       // Thread the deserialize callbacks into newContext via NewContextOptions. This
@@ -322,14 +322,14 @@ KJ_TEST("save and load V8 snapshot round-trip in same process") {
         KJ_EXPECT(check(result->Int32Value(context)) == 2);
       }
 
-      // Variable from save isolate is visible in load isolate's default context.
+      // Variable from PREPARE_SNAPSHOT isolate is visible in START_FROM_SNAPSHOT isolate's default context.
       {
         auto result = runScript("globalThis.greeting"_kj);
         v8::String::Utf8Value v(lock.v8Isolate, result);
         KJ_EXPECT(kj::StringPtr(*v) == "hello");
       }
 
-      // Function from save isolate is visible and callable (recompiled on first call).
+      // Function from PREPARE_SNAPSHOT isolate is visible and callable (recompiled on first call).
       {
         auto result = runScript("globalThis.add(40, 2)"_kj);
         KJ_EXPECT(check(result->Int32Value(context)) == 42);
@@ -353,8 +353,9 @@ KJ_TEST("save and load V8 snapshot round-trip in same process") {
 
       // The JSG-level read `globalThis.probe.value` currently still throws
       // "Illegal invocation" — the SnapshotProbe FunctionTemplate's identity differs
-      // between save and load isolates (the JSG type wrapper builds fresh templates;
-      // the wrapper inside the snapshot points at the save-side template). Restoring
+      // between PREPARE_SNAPSHOT and START_FROM_SNAPSHOT isolates (the JSG type wrapper builds
+      // fresh templates; the wrapper inside the snapshot points at the PREPARE_SNAPSHOT-side
+      // template). Restoring
       // template identity across the snapshot boundary is a separate problem from the
       // SerializeInternalFieldsCallback path this PoC validates, so we don't assert it.
     });
@@ -375,15 +376,15 @@ KJ_TEST(
   kj::Array<kj::byte> blobBytes;
   kj::Array<intptr_t> refs;
 
-  // === SAVE phase ===
+  // === PREPARE_SNAPSHOT phase ===
   {
-    SnapIsolate saveIsolate(v8System, v8::IsolateGroup::GetDefault(), nullptr,
+    SnapIsolate prepareIsolate(v8System, v8::IsolateGroup::GetDefault(), nullptr,
         kj::heap<IsolateObserver>(), defaultExternalStringAllocator(), v8::Isolate::CreateParams{},
-        /*instantiateTypeWrapper=*/true, IsolateMode::SAVE_SNAPSHOT);
+        /*instantiateTypeWrapper=*/true, IsolateMode::PREPARE_SNAPSHOT);
 
     kj::Vector<kj::Own<Wrappable>> snapshotKeepalives;
 
-    saveIsolate.runInLockScope([&](SnapIsolate::Lock& lock) {
+    prepareIsolate.runInLockScope([&](SnapIsolate::Lock& lock) {
       jsg::Lock& js = lock;
       js.withinHandleScope([&] {
         auto jsContext = lock.newContext<SnapCtx>();
@@ -424,8 +425,8 @@ KJ_TEST(
           check(script->Run(context));
         }
 
-        // Standard save pipeline.
-        auto& base = static_cast<IsolateBase&>(saveIsolate);
+        // Standard PREPARE_SNAPSHOT pipeline.
+        auto& base = static_cast<IsolateBase&>(prepareIsolate);
         kj::Vector<v8::Global<v8::FunctionTemplate>*> ftHandles;
         kj::Vector<v8::Global<v8::Object>*> objHandles;
         kj::Vector<v8::Global<v8::Name>*> nameHandles;
@@ -464,16 +465,16 @@ KJ_TEST(
     });
   }
 
-  // === LOAD phase ===
+  // === START_FROM_SNAPSHOT phase ===
   SnapshotArtifact artifact{
     .blob = kj::mv(blobBytes),
     .externalReferences = kj::mv(refs),
   };
-  SnapIsolate loadIsolate(v8System, v8::IsolateGroup::GetDefault(), nullptr,
+  SnapIsolate startIsolate(v8System, v8::IsolateGroup::GetDefault(), nullptr,
       kj::heap<IsolateObserver>(), defaultExternalStringAllocator(), v8::Isolate::CreateParams{},
-      /*instantiateTypeWrapper=*/true, IsolateMode::LOAD_SNAPSHOT, artifact);
+      /*instantiateTypeWrapper=*/true, IsolateMode::START_FROM_SNAPSHOT, artifact);
 
-  loadIsolate.runInLockScope([&](SnapIsolate::Lock& lock) {
+  startIsolate.runInLockScope([&](SnapIsolate::Lock& lock) {
     jsg::Lock& js = lock;
     js.withinHandleScope([&] {
       auto* isolate = lock.v8Isolate;

@@ -191,7 +191,7 @@ class Worker: public kj::AtomicRefcounted {
   }
 
   // Returns the snapshot produced when this worker's isolate ran in
-  // jsg::IsolateMode::SAVE_SNAPSHOT (or kj::none). Ownership is transferred to the caller;
+  // jsg::IsolateMode::PREPARE_SNAPSHOT (or kj::none). Ownership is transferred to the caller;
   // subsequent calls return kj::none.
   kj::Maybe<jsg::SnapshotArtifact> getSnapshotArtifact();
 
@@ -229,13 +229,13 @@ class Worker: public kj::AtomicRefcounted {
     kj::Maybe<ConsoleFunction> decorator;
   };
 
-  // Context setup invoked once per V8 context, for all isolate modes (normal, save-snapshot,
-  // load-snapshot). Installs the WebAssembly.instantiate shim and replaces
+  // Context setup invoked once per V8 context, for all isolate modes (NORMAL,
+  // PREPARE_SNAPSHOT, START_FROM_SNAPSHOT). Installs the WebAssembly.instantiate shim and replaces
   // console.{debug,error,info,log,warn} with logging decorators. Originals and decorators are
-  // written into `outConsoleMethods` so the snapshot-save pipeline can enumerate them.
+  // written into `outConsoleMethods` so the PREPARE_SNAPSHOT pipeline can enumerate them.
   // TODO(snapshots): the decorator's FunctionTemplate carries C++ closure data referencing the
   // original console JSFunction, which V8's StartupSerializer rejects in CreateBlob — the
-  // SAVE_SNAPSHOT pipeline needs a snapshot-safe decoration path before this can be used as-is
+  // PREPARE_SNAPSHOT pipeline needs a snapshot-safe decoration path before this can be used as-is
   // in that mode.
   static void setupContext(jsg::Lock& lock,
       v8::Local<v8::Context> context,

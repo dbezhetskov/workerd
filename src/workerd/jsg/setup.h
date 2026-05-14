@@ -85,14 +85,14 @@ class V8System {
 
 // Three modes in which an isolate can be created:
 //  * NORMAL: plain `v8::Isolate::New(params)`, no SnapshotCreator. The default.
-//  * SAVE_SNAPSHOT: an isolate constructed via `v8::SnapshotCreator`, which is used later
-//    to serialize a startup snapshot via the save pipeline in worker.c++.
-//  * LOAD_SNAPSHOT: an isolate initialized from a previously-produced snapshot blob.
+//  * PREPARE_SNAPSHOT: an isolate constructed via `v8::SnapshotCreator`, which is used later
+//    to serialize a startup snapshot via the PREPARE_SNAPSHOT pipeline in worker.c++.
+//  * START_FROM_SNAPSHOT: an isolate initialized from a previously-produced snapshot blob.
 //    Not yet implemented; reserved for future work.
 enum class IsolateMode {
   NORMAL,
-  SAVE_SNAPSHOT,
-  LOAD_SNAPSHOT,
+  PREPARE_SNAPSHOT,
+  START_FROM_SNAPSHOT,
 };
 
 // V8 startup snapshot bytes paired with the matching external_references array.
@@ -363,18 +363,18 @@ class IsolateBase {
     return mode;
   }
 
-  bool isSavingSnapshot() const {
-    return mode == IsolateMode::SAVE_SNAPSHOT;
+  bool isPreparingSnapshot() const {
+    return mode == IsolateMode::PREPARE_SNAPSHOT;
   }
 
-  bool isLoadingSnapshot() const {
-    return mode == IsolateMode::LOAD_SNAPSHOT;
+  bool isStartingFromSnapshot() const {
+    return mode == IsolateMode::START_FROM_SNAPSHOT;
   }
 
-  // Only valid in SAVE_SNAPSHOT mode. Asserts otherwise.
+  // Only valid in PREPARE_SNAPSHOT mode. Asserts otherwise.
   v8::SnapshotCreator* getSnapshotCreator() {
     return KJ_REQUIRE_NONNULL(
-        snapshotCreator, "getSnapshotCreator() called outside of SAVE_SNAPSHOT mode")
+        snapshotCreator, "getSnapshotCreator() called outside of PREPARE_SNAPSHOT mode")
         .get();
   }
 
@@ -436,17 +436,17 @@ class IsolateBase {
   //                and remove this member.
   std::unique_ptr<class v8::CppHeap> cppHeap;
   // V8 external references. ResourceTypeBuilder pushes callback pointers here as it registers
-  // them with V8 (lazy, on first wrap of each type). In SAVE_SNAPSHOT mode capacity is reserved
+  // them with V8 (lazy, on first wrap of each type). In PREPARE_SNAPSHOT mode capacity is reserved
   // upfront so the .begin() pointer we pass to V8 stays stable; in NORMAL mode V8 doesn't see
   // this vector and the pushes are harmless. Terminating 0 is appended once just before
   // SnapshotCreator::CreateBlob() in worker.c++.
   kj::Vector<intptr_t> externalReferences;
-  // Only used in LOAD_SNAPSHOT mode. Holds {data, raw_size} pointing into the caller-owned blob
+  // Only used in START_FROM_SNAPSHOT mode. Holds {data, raw_size} pointing into the caller-owned blob
   // bytes. V8 reads `snapshot_blob` during isolate construction and copies its content; the
   // pointed-to bytes do not need to outlive `Isolate::New`. Declared before `snapshotCreator`
   // so that `initIsolatePtr` (which captures &snapshotBlobData) sees a constructed object.
   v8::StartupData snapshotBlobData{nullptr, 0};
-  // Only set in SAVE_SNAPSHOT mode. Owns the SnapshotCreator that owns the V8 isolate referenced
+  // Only set in PREPARE_SNAPSHOT mode. Owns the SnapshotCreator that owns the V8 isolate referenced
   // by `ptr`.
   kj::Maybe<kj::Own<v8::SnapshotCreator>> snapshotCreator;
   v8::Isolate* ptr;
@@ -598,9 +598,9 @@ class IsolateBase {
 inline void isolateAddExternalReference(v8::Isolate* isolate, intptr_t addr) {
   auto& base = IsolateBase::from(isolate);
   // Only collected for snapshot creation. In NORMAL mode V8 does not see the vector and the
-  // pushes would just waste memory; skip them. In LOAD_SNAPSHOT mode the vector is supplied
+  // pushes would just waste memory; skip them. In START_FROM_SNAPSHOT mode the vector is supplied
   // externally and must not be mutated.
-  if (!base.isSavingSnapshot()) return;
+  if (!base.isPreparingSnapshot()) return;
   auto& refs = base.getExternalReferences();
   KJ_DREQUIRE(refs.size() < refs.capacity(),
       "external_references vector grew past reserved capacity; "
