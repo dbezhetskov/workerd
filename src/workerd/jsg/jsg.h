@@ -2436,6 +2436,9 @@ class Lock {
   void requestTermination();
   bool isTerminationRequested() const;
 
+  bool isPreparingSnapshot() const;
+  bool isStartingFromSnapshot() const;
+
   // RAII construct that reports amount of external memory to be manually attributed to
   // the isolate. When the returned ExtrernalMemoryAdjuster is dropped, the amount will
   // be subtracted from the isolate's external memory accounting. If the adjuster is

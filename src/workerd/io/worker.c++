@@ -511,6 +511,13 @@ static thread_local const Worker::Api* currentApi = nullptr;
 
 // Number of console methods wrapped by setupContext (debug, error, info, log, warn).
 static constexpr size_t kConsoleOriginalsCount = 5;
+static constexpr const char* kConsoleMethodNames[kConsoleOriginalsCount] = {
+  "debug",
+  "error",
+  "info",
+  "log",
+  "warn",
+};
 
 // Snapshot internal-fields callback header: 4-byte big-endian typeId followed by raw bytes.
 static constexpr size_t kSnapshotHeaderBytes = 4;
@@ -1484,7 +1491,7 @@ Worker::Script::Script(kj::Own<const Isolate> isolateParam,
         Worker::Api::NewContextOptions newCtxOpts;
         newCtxOpts.newModuleRegistry = impl->getNewModuleRegistry();
         newCtxOpts.schemaLoader = getSchemaLoader();
-        if (jsg::IsolateBase::from(lock.v8Isolate).isStartingFromSnapshot()) {
+        if (lock.isStartingFromSnapshot()) {
           newCtxOpts.internalFieldsDeserializer =
               v8::DeserializeInternalFieldsCallback(&workerDeserializeInternalFieldsCb, nullptr);
         }
@@ -1835,13 +1842,6 @@ void Worker::setupContext(jsg::Lock& lock,
     LogLevel::LOG,
     LogLevel::WARN,
   };
-  constexpr const char* kMethodNames[kConsoleOriginalsCount] = {
-    "debug",
-    "error",
-    "info",
-    "log",
-    "warn",
-  };
 
   auto global = context->Global();
   auto consoleStr = jsg::v8StrIntern(lock.v8Isolate, "console");
@@ -1850,7 +1850,7 @@ void Worker::setupContext(jsg::Lock& lock,
   // START_FROM_SNAPSHOT branch: rebind freshly-constructed decorator Wrappables to the holders
   // V8 restored from the snapshot. Originals (indices 1..5) and decorator wrappers
   // (indices 6..10) live at the known AddData positions established by the PREPARE_SNAPSHOT block.
-  if (jsg::IsolateBase::from(lock.v8Isolate).isStartingFromSnapshot()) {
+  if (lock.isStartingFromSnapshot()) {
     for (size_t i = 0; i < kConsoleOriginalsCount; ++i) {
       v8::Local<v8::Function> fn;
       KJ_REQUIRE(context->GetDataFromSnapshotOnce<v8::Function>(i + 1).ToLocal(&fn),
@@ -1883,7 +1883,7 @@ void Worker::setupContext(jsg::Lock& lock,
       // v8::Function::New(context, FunctorCallback::callback, holder), reusing the restored
       // holder. On LOAD this v8::Function creation is harmless — the snapshot is already done.
       auto f = lock.wrapSimpleFunction(context, kj::mv(decorator));
-      auto methodStr = jsg::v8StrIntern(lock.v8Isolate, kMethodNames[i]);
+      auto methodStr = jsg::v8StrIntern(lock.v8Isolate, kConsoleMethodNames[i]);
       jsg::check(console->Set(context, methodStr, f));
     }
     return;
@@ -1914,7 +1914,7 @@ void Worker::setupContext(jsg::Lock& lock,
   };
 
   for (size_t i = 0; i < kConsoleOriginalsCount; ++i) {
-    setHandler(kMethodNames[i], kLevels[i]);
+    setHandler(kConsoleMethodNames[i], kLevels[i]);
   }
 }
 // =======================================================================================
@@ -2027,7 +2027,7 @@ Worker::Worker(kj::Own<const Script> scriptParam,
         Worker::Api::NewContextOptions newCtxOpts;
         newCtxOpts.newModuleRegistry = script->impl->getNewModuleRegistry();
         newCtxOpts.schemaLoader = script->getSchemaLoader();
-        if (jsg::IsolateBase::from(lock.v8Isolate).isStartingFromSnapshot()) {
+        if (lock.isStartingFromSnapshot()) {
           newCtxOpts.internalFieldsDeserializer =
               v8::DeserializeInternalFieldsCallback(&workerDeserializeInternalFieldsCb, nullptr);
         }
@@ -2240,7 +2240,7 @@ Worker::Worker(kj::Own<const Script> scriptParam,
         lock.v8Isolate->SetCaptureStackTraceForUncaughtExceptions(false);
       }
 
-      if (jsg::IsolateBase::from(lock.v8Isolate).isPreparingSnapshot()) {
+      if (lock.isPreparingSnapshot()) {
         // Creating snapshot.
 
         // Snapshot part 1: Enumerate all persistent handles.
@@ -2396,13 +2396,6 @@ Worker::Worker(kj::Own<const Script> scriptParam,
           // context snapshot" invariant. On LOAD setupContext rebuilds decorators around the
           // restored holders and re-installs them on console.
           {
-            constexpr const char* kMethodNames[kConsoleOriginalsCount] = {
-              "debug",
-              "error",
-              "info",
-              "log",
-              "warn",
-            };
             auto global = context->Global();
             auto consoleStr = jsg::v8StrIntern(lock.v8Isolate, "console");
             auto consoleObj = jsg::check(global->Get(context, consoleStr)).As<v8::Object>();
@@ -2410,7 +2403,7 @@ Worker::Worker(kj::Own<const Script> scriptParam,
               auto& m = scriptImpl->consoleMethods[i];
               KJ_REQUIRE(!m.original.IsEmpty(),
                   "console original must be populated before SAVE undecorate", i);
-              auto methodStr = jsg::v8StrIntern(lock.v8Isolate, kMethodNames[i]);
+              auto methodStr = jsg::v8StrIntern(lock.v8Isolate, kConsoleMethodNames[i]);
               jsg::check(consoleObj->Set(context, methodStr, m.original.Get(lock.v8Isolate)));
             }
           }

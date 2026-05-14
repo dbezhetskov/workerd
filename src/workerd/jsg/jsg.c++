@@ -323,6 +323,14 @@ bool Lock::isTerminationRequested() const {
   return IsolateBase::from(v8Isolate).isTerminationRequested();
 }
 
+bool Lock::isPreparingSnapshot() const {
+  return IsolateBase::from(v8Isolate).isPreparingSnapshot();
+}
+
+bool Lock::isStartingFromSnapshot() const {
+  return IsolateBase::from(v8Isolate).isStartingFromSnapshot();
+}
+
 void Lock::terminateNextExecution() {
   v8Isolate->TerminateExecution();
 }
