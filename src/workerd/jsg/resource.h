@@ -1319,8 +1319,11 @@ struct ResourceTypeBuilder {
     auto& resourceWrapper = static_cast<ResourceWrapper<TypeWrapper, Type>&>(typeWrapper);
     KJ_ASSERT(
         resourceWrapper.wildcardHandler == kj::none, "only one wildcard per instance supported");
-    resourceWrapper.wildcardHandler =
-        WildcardPropertyCallbacks<TypeWrapper, Type, GetNamedMethod, getNamedMethod>{};
+    using Cb = WildcardPropertyCallbacks<TypeWrapper, Type, GetNamedMethod, getNamedMethod>;
+    resourceWrapper.wildcardHandler = Cb{};
+    addExternalReference(&Cb::getter);
+    addExternalReference(&Cb::query);
+    addExternalReference(&Cb::descriptor);
   }
 
   template <typename Type>
