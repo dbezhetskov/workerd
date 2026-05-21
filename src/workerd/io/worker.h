@@ -222,25 +222,19 @@ class Worker: public kj::AtomicRefcounted {
   kj::Promise<AsyncLock> takeAsyncLockWhenActorCacheReady(
       kj::Date now, Actor& actor, RequestObserver& request) const;
 
-  using ConsoleFunction = jsg::Function<void(const v8::FunctionCallbackInfo<v8::Value>&)>;
-
-  struct ConsoleMethod {
-    v8::Global<v8::Function> original;
-    kj::Maybe<ConsoleFunction> decorator;
-  };
-
   // Context setup invoked once per V8 context, for all isolate modes (NORMAL,
   // PREPARE_SNAPSHOT, START_FROM_SNAPSHOT). Installs the WebAssembly.instantiate shim and replaces
-  // console.{debug,error,info,log,warn} with logging decorators. Originals and decorators are
-  // written into `outConsoleMethods` so the PREPARE_SNAPSHOT pipeline can enumerate them.
-  // TODO(snapshots): the decorator's FunctionTemplate carries C++ closure data referencing the
-  // original console JSFunction, which V8's StartupSerializer rejects in CreateBlob — the
-  // PREPARE_SNAPSHOT pipeline needs a snapshot-safe decoration path before this can be used as-is
-  // in that mode.
-  static void setupContext(jsg::Lock& lock,
-      v8::Local<v8::Context> context,
+  // console.{debug,error,info,log,warn} with logging decorators. Originals are stored on
+  // Worker::Isolate so they are reachable from the static decorator callbacks.
+  static void setupContext(jsg::Lock& lock, v8::Local<v8::Context> context);
+
+  // Forward a console call to the original V8 implementation and into the worker's logging
+  // pipeline. Public so the static console decorator callbacks in worker.c++ can call it.
+  static void handleLog(jsg::Lock& js,
       const LoggingOptions& loggingOptions,
-      ConsoleMethod* outConsoleMethods);
+      LogLevel level,
+      const v8::Global<v8::Function>& original,
+      const v8::FunctionCallbackInfo<v8::Value>& info);
 
  private:
   kj::Own<const Script> script;
@@ -262,12 +256,6 @@ class Worker: public kj::AtomicRefcounted {
   class InspectorClient;
   class AsyncWaiter;
   friend constexpr bool _kj_internal_isPolymorphic(AsyncWaiter*);
-
-  static void handleLog(jsg::Lock& js,
-      const LoggingOptions& loggingOptions,
-      LogLevel level,
-      const v8::Global<v8::Function>& original,
-      const v8::FunctionCallbackInfo<v8::Value>& info);
 
   void processEntrypointClass(jsg::Lock& js,
       EntrypointClass cls,
@@ -527,6 +515,17 @@ class Worker::Isolate: public kj::AtomicRefcounted {
   inline kj::StringPtr getStderrPrefix() const {
     return loggingOptions.stderrPrefix;
   }
+
+  inline const LoggingOptions& getLoggingOptions() const {
+    return loggingOptions;
+  }
+
+  // Returns the original (undecorated) console method captured at setupContext time.
+  // methodIndex matches the kConsoleMethodNames ordering: 0=debug, 1=error, 2=info,
+  // 3=log, 4=warn.
+  const v8::Global<v8::Function>& getConsoleOriginal(size_t methodIndex) const;
+  void setConsoleOriginal(
+      v8::Isolate* isolate, size_t methodIndex, v8::Local<v8::Function> original) const;
 
   // Represents a weak reference back to the isolate that code within the isolate can use as an
   // indirect pointer when they want to be able to race destruction safely. A caller wishing to

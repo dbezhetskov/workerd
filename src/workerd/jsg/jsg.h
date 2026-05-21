@@ -2664,6 +2664,14 @@ class Lock {
   virtual v8::Local<v8::Function> wrapSimpleFunction(v8::Local<v8::Context> context,
       jsg::Function<void(const v8::FunctionCallbackInfo<v8::Value>& info)> simpleFunction) = 0;
 
+  // Create a plain v8::Function from a raw C++ FunctionCallback without allocating any wrapper
+  // object or registering with a FunctionTemplate. V8 stores `undefined` in the resulting SFI's
+  // `data` slot (a root constant), so the function is snapshot-safe. The callback must be
+  // registered in IsolateBase::externalReferences if the function will appear in a snapshot,
+  // and must look up any per-instance state via the isolate/context (no `data` channel here).
+  v8::Local<v8::Function> createJSFunctionFromNative(
+      v8::Local<v8::Context> context, v8::FunctionCallback callback);
+
   // A variation on wrapSimpleFunction that allows for a return value. While the wrapSimpleFunction
   // implementation passes the FunctionCallbackInfo into the called function, any call to
   // GetReturnValue().Set(...) to specify a return value will be ignored by the FunctorCallback

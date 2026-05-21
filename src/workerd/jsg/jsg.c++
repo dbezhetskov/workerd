@@ -171,6 +171,11 @@ v8::Local<v8::String> Lock::wrapString(kj::StringPtr text) {
   return v8Str(v8Isolate, text);
 }
 
+v8::Local<v8::Function> Lock::createJSFunctionFromNative(
+    v8::Local<v8::Context> context, v8::FunctionCallback callback) {
+  return check(v8::Function::New(context, callback));
+}
+
 bool Lock::toBool(v8::Local<v8::Value> value) {
   return value->BooleanValue(v8Isolate);
 }
