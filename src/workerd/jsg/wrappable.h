@@ -59,6 +59,15 @@ enum class ContextPointerSlot : int {
   MAX_POINTER_SLOT = VIRTUAL_FILE_SYSTEM,
 };
 
+// V2 (Local<Data>) embedder data slots. Read/written via
+// SetEmbedderDataV2/GetEmbedderDataV2 — distinct API from the aligned-pointer
+// slots above (which use SetAlignedPointerInEmbedderData). Indices start past
+// MAX_POINTER_SLOT so the two slot kinds never collide in the underlying
+// embedder-data array.
+enum class ContextDataSlot : int {
+  CONSOLE_ORIGINALS_HOLDER = static_cast<int>(ContextPointerSlot::MAX_POINTER_SLOT) + 1,
+};
+
 inline void setAlignedPointerInEmbedderData(
     v8::Local<v8::Context> context, ContextPointerSlot slot, void* ptr) {
   // The type tag is a small integer that should be different for every pointer

@@ -527,14 +527,21 @@ static constexpr LogLevel kConsoleLevels[kConsoleOriginalsCount] = {
 };
 
 // Shared body of the five static console decorator callbacks below. Looks up the original
-// console function and the per-isolate LoggingOptions, then forwards through Worker::handleLog.
+// console function (stashed by setupContext in a context embedder-data slot) and the per-isolate
+// LoggingOptions, then forwards through Worker::handleLog.
 static void callConsoleDecorator(
     const v8::FunctionCallbackInfo<v8::Value>& info, size_t methodIndex) {
   auto& js = jsg::Lock::from(info.GetIsolate());
   js.withinHandleScope([&] {
+    auto context = js.v8Context();
+    auto holder =
+        context->GetEmbedderDataV2(static_cast<int>(jsg::ContextDataSlot::CONSOLE_ORIGINALS_HOLDER))
+            .As<v8::Value>()
+            .As<v8::Object>();
+    auto methodStr = jsg::v8StrIntern(js.v8Isolate, kConsoleMethodNames[methodIndex]);
+    auto original = jsg::check(holder->Get(context, methodStr)).As<v8::Function>();
     auto& isolate = Worker::Isolate::from(js);
-    Worker::handleLog(js, isolate.getLoggingOptions(), kConsoleLevels[methodIndex],
-        isolate.getConsoleOriginal(methodIndex), info);
+    Worker::handleLog(js, isolate.getLoggingOptions(), kConsoleLevels[methodIndex], original, info);
   });
 }
 
@@ -622,7 +629,7 @@ static v8::StartupData workerSerializeApiWrapperStub(v8::Local<v8::Object>, void
 // DeserializeInternalFieldsCallback. Called by V8 inside Context::New() while restoring the
 // default context graph. For workerd Wrappable wrappers we restore the WORKERD_WRAPPABLE_TAG
 // and pin the Wrappable* slot to nullptr — the actual C++ object is reattached later by the
-// embedder (see Worker::setupContext START_FROM_SNAPSHOT branch for console decorators).
+// embedder.
 static void workerDeserializeInternalFieldsCb(
     v8::Local<v8::Object> holder, int index, v8::StartupData payload, void* /*data*/) {
   if (index == jsg::Wrappable::WRAPPABLE_TAG_FIELD_INDEX) {
@@ -712,12 +719,6 @@ struct Worker::Isolate::Impl {
   // attempt. This allows watchdogs to see evidence of forward progress in other threads, even if
   // their own thread has blocked waiting for the lock for a long time.
   mutable uint64_t lockSuccessCount = 0;
-
-  // Original (undecorated) console.{debug,error,info,log,warn} functions captured at
-  // setupContext time. Indexed by kConsoleMethodNames order. Filled by setupContext during
-  // NORMAL/PREPARE_SNAPSHOT setup; restored from snapshot indices 1..kConsoleOriginalsCount on
-  // START_FROM_SNAPSHOT.
-  mutable v8::Global<v8::Function> consoleOriginals[kConsoleOriginalsCount];
 
   // Wrapper around JsgWorkerIsolate::Lock and various RAII objects which help us report metrics,
   // measure instantaneous load, avoid spurious watchdog kills, and defer context destruction.
@@ -1761,18 +1762,6 @@ const Worker::Isolate& Worker::Isolate::from(jsg::Lock& js) {
   return *static_cast<const Worker::Isolate*>(ptr);
 }
 
-const v8::Global<v8::Function>& Worker::Isolate::getConsoleOriginal(size_t methodIndex) const {
-  KJ_ASSERT(methodIndex < kConsoleOriginalsCount);
-  return impl->consoleOriginals[methodIndex];
-}
-
-void Worker::Isolate::setConsoleOriginal(
-    v8::Isolate* isolate, size_t methodIndex, v8::Local<v8::Function> original) const {
-  KJ_ASSERT(methodIndex < kConsoleOriginalsCount);
-  // Caller holds the isolate lock — see e.g. setupContext.
-  impl->consoleOriginals[methodIndex].Reset(isolate, original);
-}
-
 bool Worker::Isolate::Impl::Lock::checkInWithLimitEnforcer(Worker::Isolate& isolate) {
   shouldReportIsolateMetrics = true;
   return limitEnforcer.exitJs(*lock);
@@ -1906,30 +1895,31 @@ void Worker::setupContext(jsg::Lock& lock, v8::Local<v8::Context> context) {
   auto global = context->Global();
   auto consoleStr = jsg::v8StrIntern(lock.v8Isolate, "console");
   auto console = jsg::check(global->Get(context, consoleStr)).As<v8::Object>();
-  auto& isolate = Worker::Isolate::from(lock);
+
+  // On LOAD, the context snapshot already restored both the decorators on `console` and the
+  // originals holder in the embedder-data slot. Re-running this loop would overwrite the
+  // decorators (losing any user-attached own-properties on them). See snapshot-skip-setup-on-load.
+  if (lock.isStartingFromSnapshot()) return;
 
   // Replace V8's default console.{debug,error,info,log,warn} with our decorators. Each decorator
   // is a plain v8::Function::New(context, callback) with no `data` — so no FunctionTemplate or
-  // wrapper object is created, and the result is snapshot-clean. The callbacks find the
-  // per-isolate original console functions and LoggingOptions via Worker::Isolate::from(js).
-  const bool isStartingFromSnapshot = lock.isStartingFromSnapshot();
+  // wrapper object is created, and the result is snapshot-clean. The originals are stashed in a
+  // context embedder-data slot so the static callbacks can retrieve them via
+  // context->GetEmbedderDataV2(...) without any isolate-side storage.
+  //
+  // v8::Object::New(isolate) reads the isolate's currently-entered context, but setupContext()
+  // is called before JSG_WITHIN_CONTEXT_SCOPE, so we have to enter the context locally first.
+  v8::Context::Scope contextScope(context);
+  auto holder = v8::Object::New(lock.v8Isolate);
   for (size_t i = 0; i < kConsoleOriginalsCount; ++i) {
     auto methodStr = jsg::v8StrIntern(lock.v8Isolate, kConsoleMethodNames[i]);
-    v8::Local<v8::Function> original;
-    if (isStartingFromSnapshot) {
-      KJ_REQUIRE(context->GetDataFromSnapshotOnce<v8::Function>(i + 1).ToLocal(&original),
-          "START_FROM_SNAPSHOT: console original missing at snapshot index", i + 1);
-    } else {
-      original = jsg::check(console->Get(context, methodStr)).As<v8::Function>();
-    }
-    isolate.setConsoleOriginal(lock.v8Isolate, i, original);
-
-    // After deserializing snapshot it is already done.
-    if (isStartingFromSnapshot) continue;
-
-    auto f = lock.createJSFunctionFromNative(context, kConsoleCallbacks[i]);
-    jsg::check(console->Set(context, methodStr, f));
+    auto original = jsg::check(console->Get(context, methodStr)).As<v8::Function>();
+    jsg::check(holder->Set(context, methodStr, original));
+    auto decorator = lock.createJSFunctionFromNative(context, kConsoleCallbacks[i]);
+    jsg::check(console->Set(context, methodStr, decorator));
   }
+  context->SetEmbedderDataV2(
+      static_cast<int>(jsg::ContextDataSlot::CONSOLE_ORIGINALS_HOLDER), holder);
 }
 // =======================================================================================
 
@@ -2294,18 +2284,9 @@ Worker::Worker(kj::Own<const Script> scriptParam,
           jsg::Lock& js = lock;
           jsg::IsolateBase& isolateBase = jsg::IsolateBase::from(js.v8Isolate);
 
-          // Snapshot part 2a: Pin console originals at fixed snapshot indices 1..5 (after the
-          // module namespace at index 0). The LOAD side pulls them via
-          // GetDataFromSnapshotOnce<v8::Function>(i+1) from Worker::setupContext.
-          auto& workerIsolate = Worker::Isolate::from(lock);
-          for (size_t i = 0; i < kConsoleOriginalsCount; ++i) {
-            auto& original = workerIsolate.getConsoleOriginal(i);
-            KJ_REQUIRE(!original.IsEmpty(),
-                "console original must be populated before snapshot serialization", i);
-            auto idx =
-                isolateBase.getSnapshotCreator()->AddData(context, original.Get(lock.v8Isolate));
-            KJ_REQUIRE(idx == i + 1, "console original index drift", idx, i);
-          }
+          // Console originals travel with the context snapshot via the embedder-data holder
+          // installed by Worker::setupContext (ContextDataSlot::CONSOLE_ORIGINALS_HOLDER). No
+          // explicit AddData(context, original) pinning is needed.
 
           // Snapshot part 2b: Preserve js objects in the snapshot.
           for (auto& handle: activeHandles) {
@@ -2477,7 +2458,7 @@ void Worker::processEntrypointClass(jsg::Lock& js,
 void Worker::handleLog(jsg::Lock& js,
     const LoggingOptions& loggingOptions,
     LogLevel level,
-    const v8::Global<v8::Function>& original,
+    v8::Local<v8::Function> original,
     const v8::FunctionCallbackInfo<v8::Value>& info) {
   // Call original V8 implementation so messages sent to connected inspector if any
   auto context = js.v8Context();
@@ -2487,7 +2468,7 @@ void Worker::handleLog(jsg::Lock& js,
   // 3 is just the number of args we currently pass.
   v8::LocalVector<v8::Value> args(js.v8Isolate, length + 3);
   for (auto i: kj::zeroTo(length)) args[i] = info[i];
-  jsg::check(original.Get(js.v8Isolate)->Call(context, info.This(), length, args.data()));
+  jsg::check(original->Call(context, info.This(), length, args.data()));
 
   // The TryCatch is initialized here to catch cases where the v8 isolate's execution is
   // terminating, usually as a result of an infinite loop. We need to perform the initialization

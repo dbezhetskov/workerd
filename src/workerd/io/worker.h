@@ -224,8 +224,9 @@ class Worker: public kj::AtomicRefcounted {
 
   // Context setup invoked once per V8 context, for all isolate modes (NORMAL,
   // PREPARE_SNAPSHOT, START_FROM_SNAPSHOT). Installs the WebAssembly.instantiate shim and replaces
-  // console.{debug,error,info,log,warn} with logging decorators. Originals are stored on
-  // Worker::Isolate so they are reachable from the static decorator callbacks.
+  // console.{debug,error,info,log,warn} with logging decorators. Originals are stashed in a
+  // context embedder-data slot so the decorator callbacks can retrieve them from the current
+  // context without isolate-side storage.
   static void setupContext(jsg::Lock& lock, v8::Local<v8::Context> context);
 
   // Forward a console call to the original V8 implementation and into the worker's logging
@@ -233,7 +234,7 @@ class Worker: public kj::AtomicRefcounted {
   static void handleLog(jsg::Lock& js,
       const LoggingOptions& loggingOptions,
       LogLevel level,
-      const v8::Global<v8::Function>& original,
+      v8::Local<v8::Function> original,
       const v8::FunctionCallbackInfo<v8::Value>& info);
 
  private:
@@ -519,13 +520,6 @@ class Worker::Isolate: public kj::AtomicRefcounted {
   inline const LoggingOptions& getLoggingOptions() const {
     return loggingOptions;
   }
-
-  // Returns the original (undecorated) console method captured at setupContext time.
-  // methodIndex matches the kConsoleMethodNames ordering: 0=debug, 1=error, 2=info,
-  // 3=log, 4=warn.
-  const v8::Global<v8::Function>& getConsoleOriginal(size_t methodIndex) const;
-  void setConsoleOriginal(
-      v8::Isolate* isolate, size_t methodIndex, v8::Local<v8::Function> original) const;
 
   // Represents a weak reference back to the isolate that code within the isolate can use as an
   // indirect pointer when they want to be able to race destruction safely. A caller wishing to
