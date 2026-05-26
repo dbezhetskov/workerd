@@ -4566,12 +4566,17 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
         kj::mv(zygoteArtifactBundler),
         /*newModuleRegistry=*/kj::none);
 
-    auto noopCompileBindings = [](jsg::Lock&, const Worker::Api&, v8::Local<v8::Object>,
-                                   v8::Local<v8::Object>) {};
+    // Use the same binding-compilation logic as the real Worker. The ctxExports machinery
+    // (handle save for validateHandlers) is bookkeeping for Worker B only — zygote is
+    // throwaway. Non-pure-data branches inside createBindingValue fail loudly when
+    // isPreparingSnapshot() — see workerd-api.c++.
+    auto zygoteCompileBindings =
+        [&](jsg::Lock& lock, const Worker::Api& api, v8::Local<v8::Object> target,
+            v8::Local<v8::Object> /*ctxExports*/) { def.compileBindings(lock, api, target); };
 
     auto zygoteWorker =
         kj::atomicRefcounted<Worker>(kj::mv(zygoteScript), kj::atomicRefcounted<WorkerObserver>(),
-            kj::mv(noopCompileBindings), IsolateObserver::StartType::COLD, SpanParent(nullptr),
+            kj::mv(zygoteCompileBindings), IsolateObserver::StartType::COLD, SpanParent(nullptr),
             Worker::Lock::TakeSynchronously(kj::none), errorReporter);
 
     // Move the snapshot into process-lifetime storage BEFORE the zygote Worker is destroyed.
@@ -4676,6 +4681,12 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
     // entrypoints, which we cannot do until after the Worker constructor completes. We are
     // permitted to hold a handle until then, though.
     ctxExportsHandle = lock.v8Ref(ctxExports);
+
+    // In START_FROM_SNAPSHOT mode, the bindings env was populated by the zygote and restored from
+    // snapshot index 1 by Worker::Impl (see worker.c++).
+    if (jsg::IsolateBase::from(lock.v8Isolate).isStartingFromSnapshot()) {
+      return;
+    }
 
     return def.compileBindings(lock, api, target);
   };

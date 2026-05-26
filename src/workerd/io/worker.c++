@@ -2072,10 +2072,25 @@ Worker::Worker(kj::Own<const Script> scriptParam,
           try {
             currentSpan = maybeMakeSpan("lw:globals_instantiation"_kjc);
 
+            auto& isolateBase = jsg::IsolateBase::from(lock.v8Isolate);
+            const bool isPreparingSnapshot = isolateBase.isPreparingSnapshot();
+            const bool isStartingFromSnapshot = isolateBase.isStartingFromSnapshot();
+            const bool restoreEnvFromSnapshot = isStartingFromSnapshot && script->isModular();
+
             v8::Local<v8::Object> bindingsScope;
             if (script->isModular()) {
-              // Use `env` variable.
-              bindingsScope = v8::Object::New(lock.v8Isolate);
+              if (restoreEnvFromSnapshot) {
+                // Env was populated by the zygote and pinned at snapshot index 1 (see the
+                // PREPARE_SNAPSHOT AddData call below, mirrored on the module-namespace
+                // pattern at index 0). Recover it instead of building a fresh object and
+                // re-running compileBindings.
+                v8::Local<v8::Object> envFromSnap;
+                KJ_REQUIRE(context->GetDataFromSnapshotOnce<v8::Object>(1).ToLocal(&envFromSnap),
+                    "START_FROM_SNAPSHOT: env missing from snapshot at index 1");
+                bindingsScope = envFromSnap;
+              } else {
+                bindingsScope = v8::Object::New(lock.v8Isolate);
+              }
               if (!FeatureFlags::get(js).getDisableImportableEnv()) {
                 lock.setWorkerEnv(lock.v8Ref(bindingsScope));
               }
@@ -2113,10 +2128,6 @@ Worker::Worker(kj::Own<const Script> scriptParam,
             // to eval() could have come from a remote source on which we don't have a record.
             js.setAllowEval(FeatureFlags::get(js).getAllowEvalDuringStartup());
             KJ_DEFER(js.setAllowEval(false));
-
-            auto& isolateBase = jsg::IsolateBase::from(lock.v8Isolate);
-            const bool isPreparingSnapshot = isolateBase.isPreparingSnapshot();
-            const bool isStartingFromSnapshot = isolateBase.isStartingFromSnapshot();
 
             KJ_SWITCH_ONEOF(script->impl->unboundScriptOrMainModule) {
               KJ_CASE_ONEOF(unboundScript, jsg::NonModuleScript) {
@@ -2156,6 +2167,16 @@ Worker::Worker(kj::Own<const Script> scriptParam,
                     // end of this Worker ctor performs all subsequent AddData calls.
                     auto idx = isolateBase.getSnapshotCreator()->AddData(context, ns);
                     KJ_REQUIRE(idx == 0, "module namespace must be the first AddData entry", idx);
+                    // Save env (bindingsScope) at snapshot index 1 for modular workers — the
+                    // zygote populated it via compileBindings(); START_FROM_SNAPSHOT retrieves
+                    // it via GetDataFromSnapshotOnce<v8::Object>(1) above. For service-worker
+                    // style scripts, bindingsScope is context->Global() — no separate entry
+                    // needed since the global is already part of the context snapshot.
+                    if (script->isModular()) {
+                      auto envIdx =
+                          isolateBase.getSnapshotCreator()->AddData(context, bindingsScope);
+                      KJ_REQUIRE(envIdx == 1, "env must be the second AddData entry", envIdx);
+                    }
                   }
                   if (!isPreparingSnapshot) {
                     impl->env = lock.v8Ref(bindingsScope.As<v8::Value>());

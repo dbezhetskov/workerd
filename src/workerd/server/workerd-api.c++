@@ -590,6 +590,14 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
   using Global = WorkerdApi::Global;
   auto context = lock.v8Context();
 
+  // In snapshot-preparation mode (zygote Worker), only pure-data bindings — Global::Json,
+  // kj::String, kj::Array<byte> — are safe: they materialize as plain v8 primitives that V8
+  // can snapshot directly. All JSG resource wrappers go through lock.wrap(lock.alloc<...>())
+  // which allocates Wrappable objects holding v8::Global handles outside the snapshot graph,
+  // so we fail loudly per-branch with the binding's name and type. Lift each KJ_REQUIRE as
+  // we add snapshotSerialize support for that resource.
+  const bool inSnapshot = jsg::IsolateBase::from(lock.v8Isolate).isPreparingSnapshot();
+
   v8::Local<v8::Value> value;
 
   // When new binding types are created. If their value resolves to be a string
@@ -612,6 +620,8 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
     }
 
     KJ_CASE_ONEOF(pipeline, Global::Fetcher) {
+      KJ_REQUIRE(
+          !inSnapshot, "Fetcher (service) binding not yet supported in snapshot mode", global.name);
       value = lock.wrap(context,
           lock.alloc<api::Fetcher>(pipeline.channel,
               pipeline.requiresHost ? api::Fetcher::RequiresHostAndProtocol::YES
@@ -620,31 +630,39 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
     }
 
     KJ_CASE_ONEOF(loopback, Global::LoopbackServiceStub) {
+      KJ_REQUIRE(!inSnapshot, "LoopbackServiceStub binding not yet supported in snapshot mode",
+          global.name);
       value = lock.wrap(context, lock.alloc<api::LoopbackServiceStub>(loopback.channel));
     }
 
     KJ_CASE_ONEOF(ns, Global::KvNamespace) {
+      KJ_REQUIRE(
+          !inSnapshot, "KvNamespace binding not yet supported in snapshot mode", global.name);
       value = lock.wrap(context,
           lock.alloc<api::KvNamespace>(kj::str(ns.bindingName),
               kj::Array<api::KvNamespace::AdditionalHeader>{}, ns.subrequestChannel));
     }
 
     KJ_CASE_ONEOF(r2, Global::R2Bucket) {
+      KJ_REQUIRE(!inSnapshot, "R2Bucket binding not yet supported in snapshot mode", global.name);
       value = lock.wrap(context,
           lock.alloc<api::public_beta::R2Bucket>(
               featureFlags, r2.subrequestChannel, kj::str(r2.bucket), kj::str(r2.bindingName)));
     }
 
     KJ_CASE_ONEOF(r2a, Global::R2Admin) {
+      KJ_REQUIRE(!inSnapshot, "R2Admin binding not yet supported in snapshot mode", global.name);
       value = lock.wrap(
           context, lock.alloc<api::public_beta::R2Admin>(featureFlags, r2a.subrequestChannel));
     }
 
     KJ_CASE_ONEOF(ns, Global::QueueBinding) {
+      KJ_REQUIRE(!inSnapshot, "Queue binding not yet supported in snapshot mode", global.name);
       value = lock.wrap(context, lock.alloc<api::WorkerQueue>(ns.subrequestChannel));
     }
 
     KJ_CASE_ONEOF(key, Global::CryptoKey) {
+      KJ_REQUIRE(!inSnapshot, "CryptoKey binding not yet supported in snapshot mode", global.name);
       api::SubtleCrypto::ImportKeyData keyData;
       KJ_SWITCH_ONEOF(key.keyData) {
         KJ_CASE_ONEOF(data, kj::Array<byte>) {
@@ -670,6 +688,8 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
     }
 
     KJ_CASE_ONEOF(cache, Global::MemoryCache) {
+      KJ_REQUIRE(
+          !inSnapshot, "MemoryCache binding not yet supported in snapshot mode", global.name);
       value = lock.wrap(context,
           lock.alloc<api::MemoryCache>(
               api::SharedMemoryCache::Use(memoryCacheProvider.getInstance(cache.cacheId),
@@ -681,20 +701,29 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
     }
 
     KJ_CASE_ONEOF(ns, Global::EphemeralActorNamespace) {
+      KJ_REQUIRE(!inSnapshot, "EphemeralActorNamespace binding not yet supported in snapshot mode",
+          global.name);
       value = lock.wrap(context, lock.alloc<api::ColoLocalActorNamespace>(ns.actorChannel));
     }
     KJ_CASE_ONEOF(ns, Global::LoopbackEphemeralActorNamespace) {
+      KJ_REQUIRE(!inSnapshot,
+          "LoopbackEphemeralActorNamespace binding not yet supported in snapshot mode",
+          global.name);
       value = lock.wrap(context,
           lock.alloc<api::LoopbackColoLocalActorNamespace>(
               ns.actorChannel, lock.alloc<api::LoopbackDurableObjectClass>(ns.classChannel)));
     }
 
     KJ_CASE_ONEOF(ns, Global::DurableActorNamespace) {
+      KJ_REQUIRE(!inSnapshot, "DurableObjectNamespace binding not yet supported in snapshot mode",
+          global.name);
       value = lock.wrap(context,
           lock.alloc<api::DurableObjectNamespace>(
               ns.actorChannel, kj::heap<ActorIdFactoryImpl>(ns.uniqueKey)));
     }
     KJ_CASE_ONEOF(ns, Global::LoopbackDurableActorNamespace) {
+      KJ_REQUIRE(!inSnapshot,
+          "LoopbackDurableObjectNamespace binding not yet supported in snapshot mode", global.name);
       value = lock.wrap(context,
           lock.alloc<api::LoopbackDurableObjectNamespace>(ns.actorChannel,
               kj::heap<ActorIdFactoryImpl>(ns.uniqueKey),
@@ -702,6 +731,8 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
     }
 
     KJ_CASE_ONEOF(ae, Global::AnalyticsEngine) {
+      KJ_REQUIRE(
+          !inSnapshot, "AnalyticsEngine binding not yet supported in snapshot mode", global.name);
       // Use subrequestChannel as logfwdrChannel
       value = lock.wrap(context,
           lock.alloc<api::AnalyticsEngine>(
@@ -717,6 +748,7 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
     }
 
     KJ_CASE_ONEOF(wrapped, Global::Wrapped) {
+      KJ_REQUIRE(!inSnapshot, "Wrapped binding not yet supported in snapshot mode", global.name);
       auto moduleRegistry = jsg::ModuleRegistry::from(lock);
       auto moduleName = kj::Path::parse(wrapped.moduleName);
 
@@ -749,29 +781,39 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
       }
     }
     KJ_CASE_ONEOF(hyperdrive, Global::Hyperdrive) {
+      KJ_REQUIRE(!inSnapshot, "Hyperdrive binding not yet supported in snapshot mode", global.name);
       value = lock.wrap(context,
           lock.alloc<api::Hyperdrive>(hyperdrive.subrequestChannel, kj::str(hyperdrive.database),
               kj::str(hyperdrive.user), kj::str(hyperdrive.password), kj::str(hyperdrive.scheme)));
     }
     KJ_CASE_ONEOF(unsafe, Global::UnsafeEval) {
+      KJ_REQUIRE(!inSnapshot, "UnsafeEval binding not yet supported in snapshot mode", global.name);
       value = lock.wrap(context, lock.alloc<api::UnsafeEval>());
     }
 
     KJ_CASE_ONEOF(actorClass, Global::ActorClass) {
+      KJ_REQUIRE(!inSnapshot, "DurableObjectClass binding not yet supported in snapshot mode",
+          global.name);
       value = lock.wrap(context, lock.alloc<api::DurableObjectClass>(actorClass.channel));
     }
 
     KJ_CASE_ONEOF(actorClass, Global::LoopbackActorClass) {
+      KJ_REQUIRE(!inSnapshot,
+          "LoopbackDurableObjectClass binding not yet supported in snapshot mode", global.name);
       value = lock.wrap(context, lock.alloc<api::LoopbackDurableObjectClass>(actorClass.channel));
     }
 
     KJ_CASE_ONEOF(workerLoader, Global::WorkerLoader) {
+      KJ_REQUIRE(
+          !inSnapshot, "WorkerLoader binding not yet supported in snapshot mode", global.name);
       value = lock.wrap(context,
           lock.alloc<api::WorkerLoader>(
               workerLoader.channel, CompatibilityDateValidation::CODE_VERSION));
     }
 
     KJ_CASE_ONEOF(_, Global::WorkerdDebugPort) {
+      KJ_REQUIRE(
+          !inSnapshot, "WorkerdDebugPort binding not yet supported in snapshot mode", global.name);
       value = lock.wrap(context, lock.alloc<WorkerdDebugPortConnector>());
     }
   }
@@ -785,6 +827,8 @@ void WorkerdApi::compileGlobals(jsg::Lock& lockParam,
     uint32_t ownerId) const {
   TRACE_EVENT("workerd", "WorkerdApi::compileGlobals()");
   auto& lock = kj::downcast<JsgWorkerdIsolate::Lock>(lockParam);
+  const bool inSnapshot = jsg::IsolateBase::from(lockParam.v8Isolate).isPreparingSnapshot();
+  KJ_DBG("compileGlobals invoked", globals.size(), inSnapshot);
   lockParam.withinHandleScope([&] {
     auto& featureFlags = *impl->features;
 
