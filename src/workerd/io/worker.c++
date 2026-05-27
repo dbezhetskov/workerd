@@ -1263,6 +1263,10 @@ Worker::Isolate::Isolate(kj::Own<Api> apiParam,
       for (auto cb: kConsoleCallbacks) {
         refs.add(reinterpret_cast<intptr_t>(cb));
       }
+      // The SyntheticModuleEvaluationSteps callback is embedded by V8 in every synthetic
+      // v8::Module object on the heap; register it right after the console callbacks so SAVE/LOAD
+      // resolve it at the same fixed leading index.
+      refs.add(jsg::getSyntheticModuleEvalRef());
     }
 
     lock->setCaptureThrowsAsRejections(features.getCaptureThrowsAsRejections());
