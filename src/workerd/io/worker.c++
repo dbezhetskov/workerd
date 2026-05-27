@@ -1885,15 +1885,17 @@ void shimWebAssemblyInstantiate(jsg::Lock& lock, v8::Local<v8::Context> context)
 }
 
 void Worker::setupContext(jsg::Lock& lock, v8::Local<v8::Context> context) {
-  // Set WebAssembly.Module @@HasInstance
+  // Both of these touch the `WebAssembly` global, which the SnapshotCreator's isolate doesn't
+  // have. Skip them while preparing a snapshot; on LOAD the global is available again (it is not
+  // part of the context snapshot) so they run normally.
   if (!lock.isPreparingSnapshot()) {
-    // SnapshotCreator's isolate doesn't have access to WebAssembly
+    // Set WebAssembly.Module @@HasInstance
     setWebAssemblyModuleHasInstance(lock, context);
-  }
 
-  // Shim WebAssembly.instantiate to detect modules exporting "__instance_signal".
-  if (util::Autogate::isEnabled(util::AutogateKey::WASM_SHUTDOWN_SIGNAL_SHIM)) {
-    shimWebAssemblyInstantiate(lock, context);
+    // Shim WebAssembly.instantiate to detect modules exporting "__instance_signal".
+    if (util::Autogate::isEnabled(util::AutogateKey::WASM_SHUTDOWN_SIGNAL_SHIM)) {
+      shimWebAssemblyInstantiate(lock, context);
+    }
   }
 
   auto global = context->Global();
