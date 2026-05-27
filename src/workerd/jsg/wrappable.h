@@ -315,6 +315,13 @@ class HeapTracer: public v8::EmbedderRootsHandler {
   }
   void clearWrappers();
 
+  // Detach the V8 wrapper from every live Wrappable, returning their kj::Owns so the caller
+  // can keep them alive across v8::SnapshotCreator::CreateBlob(). Used by the PREPARE_SNAPSHOT
+  // pipeline to clear strongWrapper Globals (which would trip V8's CheckGlobalAndEternalHandles)
+  // while leaving the C++ Wrappable* reachable from internal fields for the duration of
+  // serialization callbacks.
+  [[nodiscard]] kj::Vector<kj::Own<Wrappable>> resetAllForSnapshot();
+
   void addToFreelist(Wrappable::CppgcShim& shim);
   Wrappable::CppgcShim* allocateShim(Wrappable& wrappable);
   void clearFreelistedShims();

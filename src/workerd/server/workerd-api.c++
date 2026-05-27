@@ -827,8 +827,6 @@ void WorkerdApi::compileGlobals(jsg::Lock& lockParam,
     uint32_t ownerId) const {
   TRACE_EVENT("workerd", "WorkerdApi::compileGlobals()");
   auto& lock = kj::downcast<JsgWorkerdIsolate::Lock>(lockParam);
-  const bool inSnapshot = jsg::IsolateBase::from(lockParam.v8Isolate).isPreparingSnapshot();
-  KJ_DBG("compileGlobals invoked", globals.size(), inSnapshot);
   lockParam.withinHandleScope([&] {
     auto& featureFlags = *impl->features;
 

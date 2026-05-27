@@ -53,6 +53,29 @@ void HeapTracer::clearWrappers() {
   clearFreelistedShims();
 }
 
+kj::Vector<kj::Own<Wrappable>> HeapTracer::resetAllForSnapshot() {
+  // We use detachWrapper(shouldFreelistShim=true) rather than resetHandlesForSnapshot()
+  // because detachWrapper moves the kj::Own<Wrappable> out of CppgcShim::Active *before*
+  // the variant is replaced by Freelisted. resetHandlesForSnapshot freelists the shim
+  // first, which destroys Active and drops its Own — for Wrappables whose only strong
+  // reference is that Own (e.g. per-isolate JSG module singletons like EntrypointsModule),
+  // that would destroy *this while its ListLink is still attached, aborting in ~ListLink.
+  //
+  // The detached Owns are returned to the caller so they stay alive until after V8's
+  // SnapshotCreator::CreateBlob() finishes. CreateBlob walks every wrapped object's
+  // internal fields and invokes the embedder's SerializeInternalFieldsCallback, which
+  // dereferences the Wrappable* — if we let the Wrappables die before CreateBlob, that
+  // pointer is dangling and the serializer crashes.
+  kj::Vector<kj::Own<Wrappable>> keepalives;
+  while (!wrappers.empty()) {
+    auto own = wrappers.front().detachWrapper(true);
+    if (own.get() != nullptr) {
+      keepalives.add(kj::mv(own));
+    }
+  }
+  return keepalives;
+}
+
 using JSGWrappable = workerd::jsg::Wrappable;
 
 // V8's GC integrates with cppgc, aka "oilpan", a garbage collector for C++ objects. We want to

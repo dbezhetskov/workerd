@@ -2342,9 +2342,15 @@ Worker::Worker(kj::Own<const Script> scriptParam,
 
           // Snapshot part 3: Reset all C++ handles.
 
-          KJ_IF_SOME(moduleContext, scriptImpl->moduleContext) {
-            moduleContext->resetHandlesForSnapshot();
-          }
+          // Detach every live Wrappable: moduleContext + all per-isolate JSG singletons
+          // (CryptoImpl, BufferUtil, UtilModule, TimersUtil, EntrypointsModule, …).
+          // Leaving their strongWrapper Globals live would trip V8's
+          // CheckGlobalAndEternalHandles inside CreateBlob() below. The returned Owns
+          // must outlive CreateBlob — V8 walks every wrapped object's internal fields
+          // during serialization and dereferences the Wrappable*, so the C++ side must
+          // stay alive until CreateBlob returns.
+          auto snapshotKeepalives =
+              jsg::HeapTracer::getTracer(lock.v8Isolate).resetAllForSnapshot();
 
           // Reset module registry handles.
           if (scriptImpl->maybeNewModuleRegistry == kj::none) {
