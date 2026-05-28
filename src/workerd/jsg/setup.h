@@ -677,12 +677,6 @@ class Isolate: public IsolateBase {
   // Pass v8::IsolateGroup::Default() as the group to put all isolates in the
   // same group.
 
-  static const intptr_t* buildExternalReferences() {
-    static kj::Vector<intptr_t> externalRefs = TypeWrapper::collectAllExternalReferencesPoC();
-    externalRefs.add(static_cast<intptr_t>(0));
-    return externalRefs.begin();
-  }
-
   template <typename MetaConfiguration>
   explicit Isolate(V8System& system,
       v8::IsolateGroup group,

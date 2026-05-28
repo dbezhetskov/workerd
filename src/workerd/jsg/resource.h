@@ -631,19 +631,12 @@ template <typename TypeWrapper,
     bool isContext>
 struct GetterCallback;
 
-// Name-independent base for GetterCallback. Holds the actual callback/fastCallback
-// implementations (which don't use `methodName`). GetterCallback inherits from this base so
-// that `&GetterCallback<TW, A, M, m, c>::callback == &GetterCallback<TW, B, M, m, c>::callback`
-// regardless of the NAME pointer. Required for external references collection: ResourceTypeBuilder
-// and ExternalReferenceCollector instantiate `registerMembers<Registry>` separately and each has
-// its own `static NAME[]`, so without a shared base they would produce different callback addresses.
-template <typename TypeWrapper, typename Method, Method method, bool isContext>
-struct GetterCallbackBase;
-
 #define JSG_DEFINE_GETTER_CALLBACK_STRUCTS(...)                                                    \
-  template <typename TypeWrapper, typename T, typename Ret, typename... Args,                      \
-      Ret (T::*method)(Args...) __VA_ARGS__, bool isContext>                                       \
-  struct GetterCallbackBase<TypeWrapper, Ret (T::*)(Args...) __VA_ARGS__, method, isContext> {     \
+  template <typename TypeWrapper, const char* methodName, typename T, typename Ret,                \
+      typename... Args, Ret (T::*method)(Args...) __VA_ARGS__, bool isContext>                     \
+  struct GetterCallback<TypeWrapper, methodName, Ret (T::*)(Args...) __VA_ARGS__, method,          \
+      isContext> {                                                                                 \
+    static constexpr bool enumerable = true;                                                       \
     static void callback(v8::Local<v8::Name>, const v8::PropertyCallbackInfo<v8::Value>& info) {   \
       if constexpr (TypeWrapper::trackCallCounts) {                                                \
         callCounter.slow++;                                                                        \
@@ -684,19 +677,12 @@ struct GetterCallbackBase;
     }                                                                                              \
   };                                                                                               \
                                                                                                    \
-  template <typename TypeWrapper, const char* methodName, typename T, typename Ret,                \
-      typename... Args, Ret (T::*method)(Args...) __VA_ARGS__, bool isContext>                     \
-  struct GetterCallback<TypeWrapper, methodName, Ret (T::*)(Args...) __VA_ARGS__, method,          \
-      isContext>                                                                                   \
-      : GetterCallbackBase<TypeWrapper, Ret (T::*)(Args...) __VA_ARGS__, method, isContext> {      \
-    static constexpr bool enumerable = true;                                                       \
-  };                                                                                               \
-                                                                                                   \
   /* Specialization for methods that take `Lock&` as their first parameter. */                     \
-  template <typename TypeWrapper, typename T, typename Ret, typename... Args,                      \
-      Ret (T::*method)(Lock&, Args...) __VA_ARGS__, bool isContext>                                \
-  struct GetterCallbackBase<TypeWrapper, Ret (T::*)(Lock&, Args...) __VA_ARGS__, method,           \
+  template <typename TypeWrapper, const char* methodName, typename T, typename Ret,                \
+      typename... Args, Ret (T::*method)(Lock&, Args...) __VA_ARGS__, bool isContext>              \
+  struct GetterCallback<TypeWrapper, methodName, Ret (T::*)(Lock&, Args...) __VA_ARGS__, method,   \
       isContext> {                                                                                 \
+    static constexpr bool enumerable = true;                                                       \
     static void callback(v8::Local<v8::Name>, const v8::PropertyCallbackInfo<v8::Value>& info) {   \
       if constexpr (TypeWrapper::trackCallCounts) {                                                \
         callCounter.slow++;                                                                        \
@@ -736,14 +722,6 @@ struct GetterCallbackBase;
                 js, context, static_cast<kj::Decay<Args>*>(nullptr))...);                          \
       });                                                                                          \
     }                                                                                              \
-  };                                                                                               \
-                                                                                                   \
-  template <typename TypeWrapper, const char* methodName, typename T, typename Ret,                \
-      typename... Args, Ret (T::*method)(Lock&, Args...) __VA_ARGS__, bool isContext>              \
-  struct GetterCallback<TypeWrapper, methodName, Ret (T::*)(Lock&, Args...) __VA_ARGS__, method,   \
-      isContext>: GetterCallbackBase<TypeWrapper, Ret (T::*)(Lock&, Args...) __VA_ARGS__, method,  \
-                      isContext> {                                                                 \
-    static constexpr bool enumerable = true;                                                       \
   };                                                                                               \
                                                                                                    \
   template <typename TypeWrapper, const char* propertyName, typename T,                            \
@@ -1796,127 +1774,6 @@ struct JsSetup {
   v8::Local<v8::Context> context;
 };
 
-// PoC: Collector for external references that can be called BEFORE isolate creation
-// This demonstrates that we can collect all function pointers without needing a v8::Isolate
-template <typename TypeWrapper, typename Self, bool isContext>
-struct ExternalReferenceCollector {
-  KJ_DISALLOW_COPY_AND_MOVE(ExternalReferenceCollector);
-
-  ExternalReferenceCollector(kj::Vector<intptr_t>* external_references)
-      : external_references_(external_references) {}
-
-  template <const char* name, auto method>
-  inline void registerMethod() {
-    using Method = decltype(method);
-
-    // Collect the slow path callback pointer.
-    auto slowCallback =
-        reinterpret_cast<intptr_t>(&MethodCallback<TypeWrapper, name, isContext, Self, Method,
-                                   method, ArgumentIndexes<Method>>::callback);
-    external_references_->add(slowCallback);
-
-    // If fast API is supported, we'd also collect the fast callback.
-    if constexpr (isFastApiCompatible<Method>) {
-      auto fastCallback = reinterpret_cast<intptr_t>(MethodCallback<TypeWrapper, name, isContext,
-          Self, Method, method, ArgumentIndexes<Method>>::template fastCallback<>);
-      external_references_->add(fastCallback);
-    }
-  }
-
-  // Stub implementations for all other registry methods (don't need isolate)
-  template <typename Type>
-  inline void registerInherit() {}
-
-  template <const char* name>
-  inline void registerInheritIntrinsic(v8::Intrinsic intrinsic) {}
-
-  template <typename Method, Method method>
-  inline void registerCallable() {
-    // In real implementation, would collect MethodCallback pointer for callable
-  }
-
-  template <const char* name, typename Method, Method method>
-  inline void registerStaticMethod() {
-    // In real implementation, would collect StaticMethodCallback pointers
-  }
-
-  template <const char* name, typename Getter, Getter getter, typename Setter, Setter setter>
-  inline void registerInstanceProperty() {
-    using Gcb = GetterCallback<TypeWrapper, name, Getter, getter, isContext>;
-    external_references_->add(reinterpret_cast<intptr_t>(&Gcb::callback));
-
-    using Scb = SetterCallback<TypeWrapper, name, Setter, setter, isContext>;
-    external_references_->add(reinterpret_cast<intptr_t>(&Scb::callback));
-  }
-
-  template <const char* name, typename Getter, Getter getter, typename Setter, Setter setter>
-  inline void registerPrototypeProperty() {}
-
-  template <const char* name, typename Getter, Getter getter>
-  inline void registerReadonlyInstanceProperty() {
-    using Gcb = GetterCallback<TypeWrapper, name, Getter, getter, isContext>;
-    external_references_->add(reinterpret_cast<intptr_t>(&Gcb::callback));
-  }
-
-  template <typename T>
-  inline void registerReadonlyInstanceProperty(kj::StringPtr name, T value) {}
-
-  template <const char* name, typename Getter, Getter getter>
-  inline void registerReadonlyPrototypeProperty() {}
-
-  template <const char* name, typename Getter, Getter getter, bool readOnly>
-  inline void registerLazyInstanceProperty() {
-    using Gcb = GetterCallback<TypeWrapper, name, Getter, getter, isContext>;
-    KJ_DBG("registerLazyInstanceProperty", typeid(Getter).name(),
-        reinterpret_cast<intptr_t>(&Gcb::callback));
-    external_references_->add(reinterpret_cast<intptr_t>(&Gcb::callback));
-  }
-
-  template <const char* name, typename Getter, Getter getter>
-  inline void registerInspectProperty() {}
-
-  template <const char* name, typename T>
-  inline void registerStaticConstant(T value) {}
-
-  template <const char* name, typename Getter, Getter getter>
-  inline void registerStaticProperty() {}
-
-  template <const char* name, typename Method, Method method>
-  inline void registerIterable() {}
-
-  template <const char* name, typename Method, Method method>
-  inline void registerAsyncIterable() {}
-
-  template <const char* name, typename Method, Method method>
-  inline void registerDispose() {}
-
-  template <const char* name, typename Method, Method method>
-  inline void registerAsyncDispose() {}
-
-  template <typename Type, const char* name>
-  inline void registerNestedType() {}
-
-  inline void registerTypeScriptRoot() {}
-
-  template <const char* tsOverride>
-  inline void registerTypeScriptOverride() {}
-
-  template <const char* tsDefine>
-  inline void registerTypeScriptDefine() {}
-
-  inline void registerJsBundle(Bundle::Reader bundle) {}
-
-  template <typename Type, typename GetNamedMethod, GetNamedMethod getNamedMethod>
-  inline void registerWildcardProperty() {}
-
-  // Stub for struct property registration (used by JSG_STRUCT)
-  template <typename T, auto ptr>
-  inline void registerStructProperty(kj::StringPtr name) {}
-
- private:
-  kj::Vector<intptr_t>* external_references_;
-};
-
 class ModuleRegistryBase {
  public:
   virtual ~ModuleRegistryBase() noexcept(false) {}
@@ -2160,54 +2017,6 @@ class ResourceWrapper {
     } else {
       return kj::none;
     }
-  }
-
-  // PoC: Collect external references BEFORE creating isolate
-  // This demonstrates that we can walk the type system and collect all function pointers
-  // without needing a v8::Isolate instance
-  static kj::Vector<intptr_t> collectExternalReferencesPoC() {
-    kj::Vector<intptr_t> external_references;
-
-    // Only process resource types (those with registerMembers)
-    if constexpr (requires {
-                    &T::template registerMembers<ExternalReferenceCollector<TypeWrapper, T, false>,
-                        T>;
-                  }) {
-
-      // Create our collector (no isolate needed!)
-      ExternalReferenceCollector<TypeWrapper, T, false> collector(&external_references);
-
-      // Call registerMembers with our collector - this walks through all JSG_METHOD etc.
-      // and collects function pointers
-      if constexpr (isDetected<GetConfiguration, T>()) {
-        // If type has configuration, we'd need to construct a dummy config
-        // For PoC, we'll just skip configured types
-        // KJ_DBG("collectExternalReferences: SKIPPED (configured)", typeid(T).name());
-      } else {
-        // KJ_DBG("collectExternalReferences: calling registerMembers", typeid(T).name());
-        // auto before = external_references.size();
-        T::template registerMembers<decltype(collector), T>(collector);
-        // KJ_DBG("collectExternalReferences: done", typeid(T).name(), external_references.size() - before, "refs added");
-      }
-    }
-
-    if constexpr (requires {
-                    &T::template registerInstanceProperty<
-                        ExternalReferenceCollector<TypeWrapper, T, false>, T>;
-                  }) {
-      ExternalReferenceCollector<TypeWrapper, T, false> collector(&external_references);
-      T::template registerInstanceProperty<decltype(collector), T>(collector);
-    }
-
-    if constexpr (requires {
-                    &T::template registerReadonlyInstanceProperty<
-                        ExternalReferenceCollector<TypeWrapper, T, false>, T>;
-                  }) {
-      ExternalReferenceCollector<TypeWrapper, T, false> collector(&external_references);
-      T::template registerReadonlyInstanceProperty<decltype(collector), T>(collector);
-    }
-
-    return external_references;
   }
 
   template <bool isContext = false>

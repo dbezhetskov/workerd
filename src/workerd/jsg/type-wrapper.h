@@ -460,16 +460,6 @@ class TypeWrapper: public DynamicResourceTypeMap<Self>,
     (TypeWrapperBase<Self, T>::initTypeWrapper(), ...);
   }
 
-  // PoC: Collect external references for all registered types BEFORE isolate creation.
-  static kj::Vector<intptr_t> collectAllExternalReferencesPoC() {
-    kj::Vector<intptr_t> external_references;
-    (external_references.addAll(ResourceWrapper<Self, T>::collectExternalReferencesPoC()), ...);
-    // for (size_t i = 0; i < external_references.size(); ++i) {
-    //   KJ_DBG(reinterpret_cast<void*>(external_references[i]));
-    // }
-    return external_references;
-  }
-
   void visitHandles(
       kj::FunctionParam<void(v8::Global<v8::FunctionTemplate>&)> visitorFunctionTemplate,
       kj::FunctionParam<void(v8::Global<v8::Name>&)> visitName,
