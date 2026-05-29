@@ -412,6 +412,8 @@ class FunctionWrapper {
       //   but I'd like to do it as a separate commit which can be reverted. We also currently fail
       //   to set this on constructors and methods (see resource.h). Remember not to count
       //   injected parameters!
+      KJ_REQUIRE(!js.isPreparingSnapshot(),
+          "cannot create v8::Function with embedder data while preparing a startup snapshot");
       return check(
           v8::Function::New(context, &FunctorCallback<TypeWrapper, Signature>::callback, data));
     });
