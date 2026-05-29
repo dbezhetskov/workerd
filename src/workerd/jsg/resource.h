@@ -1358,6 +1358,7 @@ struct ResourceTypeBuilder {
         prototype->Set(isolate, name, functionTemplate);
         addExternalReference(&Mcb::callback);
         addExternalReference(Mcb::template fastCallback<>);
+        addExternalReference(cFunction.GetTypeInfo());
         return;
       }
     }
@@ -1391,6 +1392,7 @@ struct ResourceTypeBuilder {
         constructor->Set(v8StrIntern(isolate, name), functionTemplate);
         addExternalReference(&Smcb::callback);
         addExternalReference(Smcb::template fastCallback<>);
+        addExternalReference(cFunction.GetTypeInfo());
         return;
       }
     }
@@ -1450,6 +1452,9 @@ struct ResourceTypeBuilder {
             v8::Local<v8::Value>(), signature, specCompliant ? 1 : 0,
             v8::ConstructorBehavior::kThrow, v8::SideEffectType::kHasSideEffect,
             {&setterCFunction, 1});
+
+        addExternalReference(getterCFunction.GetTypeInfo());
+        addExternalReference(setterCFunction.GetTypeInfo());
 
         useSlowApi = false;
       }
