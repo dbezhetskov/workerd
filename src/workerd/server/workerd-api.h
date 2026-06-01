@@ -322,10 +322,14 @@ class WorkerdApi final: public Worker::Api {
     Global clone() const;
   };
 
+  // `applySnapshotFilter` controls the zygote-snapshot binding filtering (see the .c++
+  // implementation). It must stay true for the env-bindings pass and false for passes that
+  // build unrelated binding sets (e.g. ctx.exports) which must never be filtered by mode.
   void compileGlobals(jsg::Lock& lock,
       kj::ArrayPtr<const Global> globals,
       v8::Local<v8::Object> target,
-      uint32_t ownerId) const;
+      uint32_t ownerId,
+      bool applySnapshotFilter = true) const;
 
   // Part of the original module registry API.
   static kj::Maybe<jsg::ModuleRegistry::ModuleInfo> tryCompileModule(jsg::Lock& js,

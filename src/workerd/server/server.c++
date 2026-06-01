@@ -4683,11 +4683,9 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
     ctxExportsHandle = lock.v8Ref(ctxExports);
 
     // In START_FROM_SNAPSHOT mode, the bindings env was populated by the zygote and restored from
-    // snapshot index 1 by Worker::Impl (see worker.c++).
-    if (jsg::IsolateBase::from(lock.v8Isolate).isStartingFromSnapshot()) {
-      return;
-    }
-
+    // snapshot index 1 by Worker::Impl (see worker.c++), so most bindings are already present.
+    // We still run compileBindings here: compileGlobals filters by isolate mode and adds only the
+    // bindings that were deferred past snapshot prep (e.g. Fetcher) onto the restored env.
     return def.compileBindings(lock, api, target);
   };
   auto worker = kj::atomicRefcounted<Worker>(kj::mv(script), kj::atomicRefcounted<WorkerObserver>(),
@@ -4762,8 +4760,12 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
     totalActorChannels = nextActorChannel;
 
     JSG_WITHIN_CONTEXT_SCOPE(lock, lock.getContext(), [&](jsg::Lock& js) {
+      // ctx.exports are loopback entrypoint stubs built fresh for the real Worker; they are never
+      // part of the zygote snapshot, so opt out of the snapshot binding filter (which would
+      // otherwise strip all non-deferred bindings in START_FROM_SNAPSHOT mode).
       WorkerdApi::from(worker->getIsolate().getApi())
-          .compileGlobals(lock, ctxExports, ctxExportsHandle.getHandle(js), 1);
+          .compileGlobals(lock, ctxExports, ctxExportsHandle.getHandle(js), 1,
+              /*applySnapshotFilter=*/false);
     });
 
     // As an optimization, drop this now while we have the lock.

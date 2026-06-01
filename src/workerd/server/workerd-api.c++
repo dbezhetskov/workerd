@@ -581,6 +581,14 @@ void WorkerdApi::compileModules(jsg::Lock& lockParam,
   });
 }
 
+// Bindings that hold a live JSG wrapper / real I/O channel and therefore cannot be baked into
+// the zygote snapshot. They are skipped during PREPARE_SNAPSHOT and added to the
+// snapshot-restored env when the real START_FROM_SNAPSHOT Worker is built. Keeping this a single
+// predicate makes it trivial to add more binding types later as they gain the same treatment.
+static bool isDeferredForSnapshot(const WorkerdApi::Global& global) {
+  return global.value.is<WorkerdApi::Global::Fetcher>();
+}
+
 static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
     const WorkerdApi::Global& global,
     CompatibilityFlags::Reader featureFlags,
@@ -620,8 +628,10 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
     }
 
     KJ_CASE_ONEOF(pipeline, Global::Fetcher) {
-      KJ_REQUIRE(
-          !inSnapshot, "Fetcher (service) binding not yet supported in snapshot mode", global.name);
+      // Fetcher is deferred past snapshot prep (see isDeferredForSnapshot + compileGlobals): it
+      // must never reach here during PREPARE_SNAPSHOT, but it is materialized normally when the
+      // real START_FROM_SNAPSHOT Worker adds it to the restored env.
+      KJ_REQUIRE(!inSnapshot, "Fetcher binding should be deferred past snapshot prep", global.name);
       value = lock.wrap(context,
           lock.alloc<api::Fetcher>(pipeline.channel,
               pipeline.requiresHost ? api::Fetcher::RequiresHostAndProtocol::YES
@@ -824,13 +834,23 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
 void WorkerdApi::compileGlobals(jsg::Lock& lockParam,
     kj::ArrayPtr<const Global> globals,
     v8::Local<v8::Object> target,
-    uint32_t ownerId) const {
+    uint32_t ownerId,
+    bool applySnapshotFilter) const {
   TRACE_EVENT("workerd", "WorkerdApi::compileGlobals()");
   auto& lock = kj::downcast<JsgWorkerdIsolate::Lock>(lockParam);
+  auto& isolateBase = jsg::IsolateBase::from(lock.v8Isolate);
+  const bool preparing = applySnapshotFilter && isolateBase.isPreparingSnapshot();
+  const bool starting = applySnapshotFilter && isolateBase.isStartingFromSnapshot();
   lockParam.withinHandleScope([&] {
     auto& featureFlags = *impl->features;
 
     for (auto& global: globals) {
+      const bool deferred = isDeferredForSnapshot(global);
+      // Zygote: don't bake deferred bindings into the snapshot.
+      if (preparing && deferred) continue;
+      // Real Worker from snapshot: env already has every non-deferred binding restored from the
+      // snapshot; only the deferred ones still need to be added here.
+      if (starting && !deferred) continue;
       lockParam.withinHandleScope([&] {
         // Don't use String's usual TypeHandler here because we want to intern the string.
         auto value =
