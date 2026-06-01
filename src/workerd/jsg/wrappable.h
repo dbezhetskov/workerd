@@ -14,6 +14,7 @@
 
 #include <kj/common.h>
 #include <kj/debug.h>
+#include <kj/function.h>
 #include <kj/list.h>
 #include <kj/refcount.h>
 #include <kj/vector.h>
@@ -321,6 +322,12 @@ class HeapTracer: public v8::EmbedderRootsHandler {
   // while leaving the C++ Wrappable* reachable from internal fields for the duration of
   // serialization callbacks.
   [[nodiscard]] kj::Vector<kj::Own<Wrappable>> resetAllForSnapshot();
+
+  // Invoke `callback` once for each live Wrappable's JS wrapper (the v8::Object held via
+  // the Wrappable's TracedReference). Iteration order matches the wrappers list. Used by
+  // the PREPARE_SNAPSHOT pipeline to AddData() each wrapper into the snapshot before
+  // resetAllForSnapshot() drops the C++ references. Must be called under the isolate lock.
+  void forEachLiveWrapper(kj::FunctionParam<void(v8::Local<v8::Object>)> callback);
 
   void addToFreelist(Wrappable::CppgcShim& shim);
   Wrappable::CppgcShim* allocateShim(Wrappable& wrappable);

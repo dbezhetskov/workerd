@@ -2346,6 +2346,21 @@ Worker::Worker(kj::Own<const Script> scriptParam,
             }
           }
 
+          // Snapshot part 2c: Preserve every Wrappable's JS wrapper.
+          // HeapTracer::wrappers tracks the strongWrapper Globals owned by Wrappable
+          // instances themselves; visitPersistentHandles above does NOT enumerate them.
+          // Without an AddData() pin here, resetAllForSnapshot() below drops these wrappers
+          // before V8 walks the snapshot graph, and any monkey-patched state on them is
+          // lost on LOAD because V8 considers our wrappers "droppable" (see attachWrapper
+          // rationale in wrappable.c++). Skip the context global proxy — it is already
+          // covered by SetDefaultContext().
+          auto contextGlobal = context->Global();
+          jsg::HeapTracer::getTracer(lock.v8Isolate)
+              .forEachLiveWrapper([&](v8::Local<v8::Object> wrapper) {
+            if (wrapper == contextGlobal) return;
+            isolateBase.getSnapshotCreator()->AddData(context, wrapper);
+          });
+
           // Snapshot part 3: Reset all C++ handles.
 
           // Detach every live Wrappable: moduleContext + all per-isolate JSG singletons

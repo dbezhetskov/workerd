@@ -76,6 +76,14 @@ kj::Vector<kj::Own<Wrappable>> HeapTracer::resetAllForSnapshot() {
   return keepalives;
 }
 
+void HeapTracer::forEachLiveWrapper(kj::FunctionParam<void(v8::Local<v8::Object>)> callback) {
+  for (auto& w: wrappers) {
+    KJ_IF_SOME(handle, w.tryGetHandle(isolate)) {
+      callback(handle);
+    }
+  }
+}
+
 using JSGWrappable = workerd::jsg::Wrappable;
 
 // V8's GC integrates with cppgc, aka "oilpan", a garbage collector for C++ objects. We want to
