@@ -586,7 +586,16 @@ void WorkerdApi::compileModules(jsg::Lock& lockParam,
 // snapshot-restored env when the real START_FROM_SNAPSHOT Worker is built. Keeping this a single
 // predicate makes it trivial to add more binding types later as they gain the same treatment.
 static bool isDeferredForSnapshot(const WorkerdApi::Global& global) {
-  return global.value.is<WorkerdApi::Global::Fetcher>();
+  using G = WorkerdApi::Global;
+  return global.value.is<G::Fetcher>() || global.value.is<G::DurableActorNamespace>() ||
+      global.value.is<G::LoopbackServiceStub>() || global.value.is<G::KvNamespace>() ||
+      global.value.is<G::R2Bucket>() || global.value.is<G::R2Admin>() ||
+      global.value.is<G::QueueBinding>() || global.value.is<G::EphemeralActorNamespace>() ||
+      global.value.is<G::LoopbackEphemeralActorNamespace>() ||
+      global.value.is<G::LoopbackDurableActorNamespace>() ||
+      global.value.is<G::AnalyticsEngine>() || global.value.is<G::Hyperdrive>() ||
+      global.value.is<G::ActorClass>() || global.value.is<G::LoopbackActorClass>() ||
+      global.value.is<G::WorkerLoader>();
 }
 
 static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
@@ -600,11 +609,18 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
 
   // In snapshot-preparation mode (zygote Worker), only pure-data bindings — Global::Json,
   // kj::String, kj::Array<byte> — are safe: they materialize as plain v8 primitives that V8
-  // can snapshot directly. All JSG resource wrappers go through lock.wrap(lock.alloc<...>())
-  // which allocates Wrappable objects holding v8::Global handles outside the snapshot graph,
-  // so we fail loudly per-branch with the binding's name and type. Lift each KJ_REQUIRE as
-  // we add snapshotSerialize support for that resource.
+  // can snapshot directly. Channel-backed JSG resource wrappers are instead *deferred*
+  // (see isDeferredForSnapshot + compileGlobals): skipped during PREPARE_SNAPSHOT and added to the
+  // snapshot-restored env when the real START_FROM_SNAPSHOT Worker is built. The remaining resource
+  // wrappers are not yet snapshot-safe, so we fail loudly per-branch with the binding's name. Lift
+  // each KJ_REQUIRE as we add snapshotSerialize support (or deferral) for that resource.
   const bool inSnapshot = jsg::IsolateBase::from(lock.v8Isolate).isPreparingSnapshot();
+
+  // Deferred bindings are filtered out by compileGlobals during PREPARE_SNAPSHOT and only
+  // materialized when the real START_FROM_SNAPSHOT Worker adds them to the restored env. If one
+  // reaches here it must NOT be during snapshot prep.
+  KJ_REQUIRE(!inSnapshot || !isDeferredForSnapshot(global),
+      "deferred binding reached createBindingValue during snapshot prep", global.name);
 
   v8::Local<v8::Value> value;
 
@@ -628,10 +644,6 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
     }
 
     KJ_CASE_ONEOF(pipeline, Global::Fetcher) {
-      // Fetcher is deferred past snapshot prep (see isDeferredForSnapshot + compileGlobals): it
-      // must never reach here during PREPARE_SNAPSHOT, but it is materialized normally when the
-      // real START_FROM_SNAPSHOT Worker adds it to the restored env.
-      KJ_REQUIRE(!inSnapshot, "Fetcher binding should be deferred past snapshot prep", global.name);
       value = lock.wrap(context,
           lock.alloc<api::Fetcher>(pipeline.channel,
               pipeline.requiresHost ? api::Fetcher::RequiresHostAndProtocol::YES
@@ -640,34 +652,27 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
     }
 
     KJ_CASE_ONEOF(loopback, Global::LoopbackServiceStub) {
-      KJ_REQUIRE(!inSnapshot, "LoopbackServiceStub binding not yet supported in snapshot mode",
-          global.name);
       value = lock.wrap(context, lock.alloc<api::LoopbackServiceStub>(loopback.channel));
     }
 
     KJ_CASE_ONEOF(ns, Global::KvNamespace) {
-      KJ_REQUIRE(
-          !inSnapshot, "KvNamespace binding not yet supported in snapshot mode", global.name);
       value = lock.wrap(context,
           lock.alloc<api::KvNamespace>(kj::str(ns.bindingName),
               kj::Array<api::KvNamespace::AdditionalHeader>{}, ns.subrequestChannel));
     }
 
     KJ_CASE_ONEOF(r2, Global::R2Bucket) {
-      KJ_REQUIRE(!inSnapshot, "R2Bucket binding not yet supported in snapshot mode", global.name);
       value = lock.wrap(context,
           lock.alloc<api::public_beta::R2Bucket>(
               featureFlags, r2.subrequestChannel, kj::str(r2.bucket), kj::str(r2.bindingName)));
     }
 
     KJ_CASE_ONEOF(r2a, Global::R2Admin) {
-      KJ_REQUIRE(!inSnapshot, "R2Admin binding not yet supported in snapshot mode", global.name);
       value = lock.wrap(
           context, lock.alloc<api::public_beta::R2Admin>(featureFlags, r2a.subrequestChannel));
     }
 
     KJ_CASE_ONEOF(ns, Global::QueueBinding) {
-      KJ_REQUIRE(!inSnapshot, "Queue binding not yet supported in snapshot mode", global.name);
       value = lock.wrap(context, lock.alloc<api::WorkerQueue>(ns.subrequestChannel));
     }
 
@@ -711,29 +716,20 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
     }
 
     KJ_CASE_ONEOF(ns, Global::EphemeralActorNamespace) {
-      KJ_REQUIRE(!inSnapshot, "EphemeralActorNamespace binding not yet supported in snapshot mode",
-          global.name);
       value = lock.wrap(context, lock.alloc<api::ColoLocalActorNamespace>(ns.actorChannel));
     }
     KJ_CASE_ONEOF(ns, Global::LoopbackEphemeralActorNamespace) {
-      KJ_REQUIRE(!inSnapshot,
-          "LoopbackEphemeralActorNamespace binding not yet supported in snapshot mode",
-          global.name);
       value = lock.wrap(context,
           lock.alloc<api::LoopbackColoLocalActorNamespace>(
               ns.actorChannel, lock.alloc<api::LoopbackDurableObjectClass>(ns.classChannel)));
     }
 
     KJ_CASE_ONEOF(ns, Global::DurableActorNamespace) {
-      KJ_REQUIRE(!inSnapshot, "DurableObjectNamespace binding not yet supported in snapshot mode",
-          global.name);
       value = lock.wrap(context,
           lock.alloc<api::DurableObjectNamespace>(
               ns.actorChannel, kj::heap<ActorIdFactoryImpl>(ns.uniqueKey)));
     }
     KJ_CASE_ONEOF(ns, Global::LoopbackDurableActorNamespace) {
-      KJ_REQUIRE(!inSnapshot,
-          "LoopbackDurableObjectNamespace binding not yet supported in snapshot mode", global.name);
       value = lock.wrap(context,
           lock.alloc<api::LoopbackDurableObjectNamespace>(ns.actorChannel,
               kj::heap<ActorIdFactoryImpl>(ns.uniqueKey),
@@ -741,8 +737,6 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
     }
 
     KJ_CASE_ONEOF(ae, Global::AnalyticsEngine) {
-      KJ_REQUIRE(
-          !inSnapshot, "AnalyticsEngine binding not yet supported in snapshot mode", global.name);
       // Use subrequestChannel as logfwdrChannel
       value = lock.wrap(context,
           lock.alloc<api::AnalyticsEngine>(
@@ -791,7 +785,6 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
       }
     }
     KJ_CASE_ONEOF(hyperdrive, Global::Hyperdrive) {
-      KJ_REQUIRE(!inSnapshot, "Hyperdrive binding not yet supported in snapshot mode", global.name);
       value = lock.wrap(context,
           lock.alloc<api::Hyperdrive>(hyperdrive.subrequestChannel, kj::str(hyperdrive.database),
               kj::str(hyperdrive.user), kj::str(hyperdrive.password), kj::str(hyperdrive.scheme)));
@@ -802,20 +795,14 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
     }
 
     KJ_CASE_ONEOF(actorClass, Global::ActorClass) {
-      KJ_REQUIRE(!inSnapshot, "DurableObjectClass binding not yet supported in snapshot mode",
-          global.name);
       value = lock.wrap(context, lock.alloc<api::DurableObjectClass>(actorClass.channel));
     }
 
     KJ_CASE_ONEOF(actorClass, Global::LoopbackActorClass) {
-      KJ_REQUIRE(!inSnapshot,
-          "LoopbackDurableObjectClass binding not yet supported in snapshot mode", global.name);
       value = lock.wrap(context, lock.alloc<api::LoopbackDurableObjectClass>(actorClass.channel));
     }
 
     KJ_CASE_ONEOF(workerLoader, Global::WorkerLoader) {
-      KJ_REQUIRE(
-          !inSnapshot, "WorkerLoader binding not yet supported in snapshot mode", global.name);
       value = lock.wrap(context,
           lock.alloc<api::WorkerLoader>(
               workerLoader.channel, CompatibilityDateValidation::CODE_VERSION));
