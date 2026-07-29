@@ -362,9 +362,9 @@ class IsolateBase {
     return mode == IsolateMode::START_FROM_SNAPSHOT;
   }
 
-  // In PREPARE_SNAPSHOT mode: serialize the isolate with `defaultContext` as the default
-  // context and fill the SnapshotArtifact slot passed at isolate creation. No-op otherwise.
-  void prepareSnapshot(v8::Local<v8::Context> defaultContext);
+  // Serialize the isolate with the context held by `defaultContext` as the default context,
+  // consuming and resetting `defaultContext` and fill the SnapshotArtifact slot passed at isolate creation.
+  void prepareSnapshot(v8::Global<v8::Context> defaultContext);
 
   // Enumerates every resource type's constructor-template slots (memoizedConstructor and
   // contextConstructor, empty or not) for startup-snapshot handling, in a fixed compile-time
