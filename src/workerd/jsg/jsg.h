@@ -55,6 +55,10 @@ namespace workerd::jsg {
 
 // Everything needed to create a new isolate from a V8 startup snapshot:
 // * `blob` is the serialized snapshot data, allocated with `new[]` by v8::SnapshotCreator.
+// * `externalReferences` is the list of addresses of all C++ functions and objects referenced
+//   from the snapshot. The producer and the consumer of a snapshot must register exactly the
+//   same references, in the same order, or deserialization will fail.
+// * `externalReferenceCursor` is the next free slot in `externalReferences`.
 // * `mode` indicates whether this worker produces the snapshot or consumes it.
 struct SnapshotArtifact {
   enum class Mode {
@@ -63,6 +67,8 @@ struct SnapshotArtifact {
   };
 
   v8::StartupData blob{nullptr, 0};
+  kj::Array<intptr_t> externalReferences;
+  size_t externalReferenceCursor = 0;
   Mode mode;
 };
 
