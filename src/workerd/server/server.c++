@@ -5983,8 +5983,12 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
     totalActorChannels = nextActorChannel;
 
     JSG_WITHIN_CONTEXT_SCOPE(lock, lock.getContext(), [&](jsg::Lock& js) {
+      // ctx.exports are fresh loopback entrypoint stubs built for the real Worker; they are never
+      // part of the zygote snapshot, so opt out of the snapshot binding filter (which would
+      // otherwise strip all non-deferred bindings in START_FROM_SNAPSHOT mode).
       WorkerdApi::from(worker->getIsolate().getApi())
-          .compileGlobals(lock, ctxExports, ctxExportsHandle.getHandle(js), 1);
+          .compileGlobals(
+              lock, ctxExports, ctxExportsHandle.getHandle(js), 1, ApplySnapshotFilter::NO);
     });
 
     // As an optimization, drop this now while we have the lock.
