@@ -562,6 +562,24 @@ void WorkerdApi::compileModules(jsg::Lock& lockParam,
 // placed on the private `env` of a `cloudflare-internal:` module, not on the worker's own `env`.
 WD_STRONG_BOOL(IsInternalBinding);
 
+// Bindings that cannot be baked into the zygote snapshot.
+// They are skipped during PREPARE_SNAPSHOT and added to the snapshot-restored env
+// when the real START_FROM_SNAPSHOT Worker is built.
+static bool isDeferredForSnapshot(const WorkerdApi::Global& global) {
+  using G = WorkerdApi::Global;
+  return global.value.is<G::Fetcher>() || global.value.is<G::DurableActorNamespace>() ||
+      global.value.is<G::LoopbackServiceStub>() || global.value.is<G::KvNamespace>() ||
+      global.value.is<G::R2Bucket>() || global.value.is<G::QueueBinding>() ||
+      global.value.is<G::EphemeralActorNamespace>() ||
+      global.value.is<G::LoopbackEphemeralActorNamespace>() ||
+      global.value.is<G::LoopbackDurableActorNamespace>() ||
+      global.value.is<G::AnalyticsEngine>() || global.value.is<G::Hyperdrive>() ||
+      global.value.is<G::ActorClass>() || global.value.is<G::LoopbackActorClass>() ||
+      global.value.is<G::WorkerLoader>() || global.value.is<G::Wrapped>() ||
+      global.value.is<G::UnsafeEval>() || global.value.is<G::MemoryCache>() ||
+      global.value.is<G::CryptoKey>() || global.value.is<G::WorkerdDebugPort>();
+}
+
 static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
     const WorkerdApi::Global& global,
     CompatibilityFlags::Reader featureFlags,
@@ -571,6 +589,12 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
   TRACE_EVENT("workerd", "WorkerdApi::createBindingValue()");
   using Global = WorkerdApi::Global;
   auto context = lock.v8Context();
+
+  // Deferred bindings are filtered out by compileGlobals during PREPARE_SNAPSHOT and only
+  // materialized when the real START_FROM_SNAPSHOT Worker adds them to the restored env.
+  const bool inSnapshot = jsg::IsolateBase::from(lock.v8Isolate).isPreparingSnapshot();
+  KJ_REQUIRE(!inSnapshot || !isDeferredForSnapshot(global),
+      "deferred binding reached createBindingValue during snapshot prep", global.name);
 
   v8::Local<v8::Value> value;
 
@@ -759,13 +783,26 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
 void WorkerdApi::compileGlobals(jsg::Lock& lockParam,
     kj::ArrayPtr<const Global> globals,
     v8::Local<v8::Object> target,
-    uint32_t ownerId) const {
+    uint32_t ownerId,
+    ApplySnapshotFilter applySnapshotFilter) const {
   TRACE_EVENT("workerd", "WorkerdApi::compileGlobals()");
   auto& lock = kj::downcast<JsgWorkerdIsolate::Lock>(lockParam);
+  auto& isolateBase = jsg::IsolateBase::from(lock.v8Isolate);
+  const bool preparing = applySnapshotFilter && isolateBase.isPreparingSnapshot();
+  const bool starting = applySnapshotFilter && isolateBase.isStartingFromSnapshot();
   lockParam.withinHandleScope([&] {
     auto& featureFlags = *impl->features;
 
     for (auto& global: globals) {
+      const bool deferred = isDeferredForSnapshot(global);
+
+      // Zygote worker - defer this binding to the Real Worker.
+      if (preparing && deferred) continue;
+
+      // Real Worker from snapshot: env already has every non-deferred binding restored from the
+      // snapshot; only the deferred ones still need to be added here.
+      if (starting && !deferred) continue;
+
       lockParam.withinHandleScope([&] {
         // Don't use String's usual TypeHandler here because we want to intern the string.
         auto value = createBindingValue(

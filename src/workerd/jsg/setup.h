@@ -405,6 +405,10 @@ class IsolateBase {
     return false;
   }
 
+  v8::SnapshotCreator* getSnapshotCreator() {
+    return KJ_ASSERT_NONNULL(snapshotCreator).get();
+  }
+
   SnapshotArtifact& mutableSnapshotArtifact() {
     return *KJ_REQUIRE_NONNULL(snapshotConfig).get<MutableSnapshot>().artifact;
   }
