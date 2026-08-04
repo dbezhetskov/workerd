@@ -362,6 +362,12 @@ class IsolateBase {
     return mode == IsolateMode::START_FROM_SNAPSHOT;
   }
 
+  v8::SnapshotCreator* getSnapshotCreator() {
+    KJ_REQUIRE(mode == IsolateMode::PREPARE_SNAPSHOT,
+        "getSnapshotCreator() called outside of PREPARE_SNAPSHOT mode");
+    return KJ_ASSERT_NONNULL(snapshotCreator).get();
+  }
+
   // Serialize the isolate with the context held by `defaultContext` as the default context,
   // consuming and resetting `defaultContext` and fill the SnapshotArtifact slot passed at isolate creation.
   void prepareSnapshot(v8::Global<v8::Context> defaultContext);

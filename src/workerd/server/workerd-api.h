@@ -9,6 +9,7 @@
 #include <workerd/io/worker-fs.h>
 #include <workerd/io/worker.h>
 #include <workerd/server/workerd.capnp.h>
+#include <workerd/util/strong-bool.h>
 
 namespace workerd {
 namespace api {
@@ -33,6 +34,10 @@ class MemoryCacheProvider;
 namespace workerd::server {
 
 using api::pyodide::PythonConfig;
+
+// Whether compileGlobals() applies the PREPARE/START_FROM_SNAPSHOT deferred-binding filter.
+// NO compiles every binding regardless of snapshot mode.
+WD_STRONG_BOOL(ApplySnapshotFilter);
 
 // A Worker::Api implementation with support for all the APIs supported by the OSS runtime.
 class WorkerdApi final: public Worker::Api {
@@ -315,7 +320,8 @@ class WorkerdApi final: public Worker::Api {
   void compileGlobals(jsg::Lock& lock,
       kj::ArrayPtr<const Global> globals,
       v8::Local<v8::Object> target,
-      uint32_t ownerId) const;
+      uint32_t ownerId,
+      ApplySnapshotFilter applySnapshotFilter = ApplySnapshotFilter::YES) const;
 
   // Part of the original module registry API.
   static kj::Maybe<jsg::ModuleRegistry::ModuleInfo> tryCompileModule(jsg::Lock& js,

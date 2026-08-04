@@ -2171,10 +2171,19 @@ Worker::Worker(kj::Own<const Script> scriptParam,
           try {
             currentSpan = maybeMakeSpan("lw:globals_instantiation"_kjc);
 
+            auto& isolateBase = jsg::IsolateBase::from(lock.v8Isolate);
             v8::Local<v8::Object> bindingsScope;
             if (script->isModular()) {
               // Use `env` variable.
-              bindingsScope = v8::Object::New(lock.v8Isolate);
+              if (isolateBase.isStartingFromSnapshot()) {
+                v8::Local<v8::Object> bindingsScopeFromSnapshot;
+                KJ_REQUIRE(context->GetDataFromSnapshotOnce<v8::Object>(0).ToLocal(
+                               &bindingsScopeFromSnapshot),
+                    "START_FROM_SNAPSHOT: bindings scope missing from snapshot at index 0");
+                bindingsScope = bindingsScopeFromSnapshot;
+              } else {
+                bindingsScope = v8::Object::New(lock.v8Isolate);
+              }
               if (!FeatureFlags::get(js).getDisableImportableEnv()) {
                 lock.setWorkerEnv(lock.v8Ref(bindingsScope));
               }
@@ -2227,6 +2236,13 @@ Worker::Worker(kj::Own<const Script> scriptParam,
                 lock.runMicrotasks();
               }
               KJ_CASE_ONEOF(mainModule, kj::Path) {
+                if (lock.isPreparingSnapshot() && script->isModular()) {
+                  // Pin the compiled bindingsScope into the snapshot so the START_FROM_SNAPSHOT
+                  // Worker recovers it via GetDataFromSnapshotOnce<v8::Object>(0) above instead of
+                  // rebuilding it.
+                  auto idx = isolateBase.getSnapshotCreator()->AddData(context, bindingsScope);
+                  KJ_REQUIRE(idx == 0, "the bindings scope must be the first AddData entry", idx);
+                }
                 KJ_IF_SOME(ns,
                     tryResolveMainModule(lock, mainModule, *jsContext, *script, limitErrorOrTime)) {
                   // To avoid resetting Worker-level C++ handles before snapshotting, we simply do not
