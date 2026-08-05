@@ -530,9 +530,20 @@ void IsolateBase::prepareSnapshot(v8::Global<v8::Context> defaultContextHandle) 
   workerEnvObj.Reset();
   workerExportsObj.Reset();
 
-  // 2. Reset resource-type constructor templates: the memoized and context slot per
-  // JSG_RESOURCE type, owned by the TypeWrapper machinery.
-  iterateResourceTypeTemplates([&](v8::Global<v8::FunctionTemplate>& h) { h.Reset(); });
+  // 2. Bake every materialized resource-type constructor template (both the memoized and the
+  // context slot per JSG_RESOURCE type) in the snapshot and record its snapshot index so
+  // the START_FROM_SNAPSHOT isolate can restore each slot instead of rebuilding fresh
+  // FunctionTemplates. One index is recorded per slot, in enumeration order (empty slots get
+  // kNoConstructorTemplate), so the loading isolate pairs slots by position alone. Reset each
+  // slot in the same pass.
+  iterateResourceTypeTemplates([&](v8::Global<v8::FunctionTemplate>& h) {
+    if (h.IsEmpty()) {
+      artifact.constructorTemplateIndices.add(SnapshotArtifact::kNoConstructorTemplate);
+      return;
+    }
+    artifact.constructorTemplateIndices.add(creator->AddData(h.Get(ptr)));
+    h.Reset();
+  });
 
   // 3. Reset struct-type handles: dictionary template + field-name handles per JSG_STRUCT.
   visitStructTypeHandles([](v8::Global<v8::Name>& h) { h.Reset(); },

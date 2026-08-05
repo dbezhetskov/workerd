@@ -737,6 +737,7 @@ class Isolate: public IsolateBase {
     wrappers.resize(1);
     if (instantiateTypeWrapper) {
       instantiateDefaultWrapper(kj::fwd<MetaConfiguration>(configuration));
+      restoreConstructorsFromSnapshot();
     }
   }
 
@@ -758,6 +759,7 @@ class Isolate: public IsolateBase {
     wrappers.resize(1);
     if (instantiateTypeWrapper) {
       instantiateDefaultWrapper(kj::fwd<MetaConfiguration>(configuration));
+      restoreConstructorsFromSnapshot();
     }
   }
 
@@ -778,6 +780,43 @@ class Isolate: public IsolateBase {
     auto wrapper = wrapperSpace.construct(ptr, kj::fwd<MetaConfiguration>(configuration));
     wrapper->initTypeWrapper();
     wrappers[0] = kj::mv(wrapper);
+  }
+
+  // When starting from a startup snapshot, repopulate each resource type's memoizedConstructor
+  // and contextConstructor slots from the snapshot's isolate-level data instead of letting
+  // getTemplate rebuild fresh FunctionTemplates. The context constructor in particular must
+  // keep its zygote identity: newContext brands the deserialized global with it, and the
+  // v8::Signature of every snapshot-baked method references it. Must run before any context is
+  // created on this isolate.
+  void restoreConstructorsFromSnapshot() {
+    if (!isStartingFromSnapshot()) return;
+    KJ_IF_SOME(artifact, snapshotArtifact) {
+      auto& indices = artifact.constructorTemplateIndices;
+      if (indices.size() == 0) return;
+      runInV8Stack([&](V8StackScope&) {
+        v8::Isolate::Scope isolateScope(ptr);
+        v8::HandleScope handleScope(ptr);
+        // Slots are enumerated in the same fixed order as at PREPARE_SNAPSHOT (same binary,
+        // same TypeWrapper), so each slot pairs with the next recorded index by position.
+        // Note the cursor is local: one artifact is shared by every isolate loaded from it.
+        size_t cursor = 0;
+        wrappers[0]->iterateResourceTypeTemplates([&](v8::Global<v8::FunctionTemplate>& slot) {
+          KJ_REQUIRE(cursor < indices.size(),
+              "START_FROM_SNAPSHOT: more template slots than recorded at PREPARE_SNAPSHOT");
+          uint32_t snapshotIndex = indices[cursor++];
+          if (snapshotIndex == SnapshotArtifact::kNoConstructorTemplate) return;
+          v8::Local<v8::FunctionTemplate> tmpl;
+          KJ_REQUIRE(
+              ptr->GetDataFromSnapshotOnce<v8::FunctionTemplate>(snapshotIndex).ToLocal(&tmpl),
+              "START_FROM_SNAPSHOT: constructor template missing from snapshot", snapshotIndex,
+              cursor - 1);
+          slot.Reset(ptr, tmpl);
+        });
+        KJ_REQUIRE(cursor == indices.size(),
+            "START_FROM_SNAPSHOT: template slot enumeration drifted vs PREPARE_SNAPSHOT", cursor,
+            indices.size());
+      });
+    }
   }
 
   ~Isolate() noexcept(false) {
