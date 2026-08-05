@@ -2280,8 +2280,17 @@ Worker::Worker(kj::Own<const Script> scriptParam,
                   auto idx = isolateBase.getSnapshotCreator()->AddData(context, bindingsScope);
                   KJ_REQUIRE(idx == 0, "the bindings scope must be the first AddData entry", idx);
                 }
-                KJ_IF_SOME(ns,
-                    tryResolveMainModule(lock, mainModule, *jsContext, *script, limitErrorOrTime)) {
+                kj::Maybe<jsg::JsObject> maybeNs;
+                if (lock.isStartingFromSnapshot()) {
+                  v8::Local<v8::Object> nsFromSnap;
+                  KJ_REQUIRE(context->GetDataFromSnapshotOnce<v8::Object>(1).ToLocal(&nsFromSnap),
+                      "START_FROM_SNAPSHOT: module namespace missing from snapshot at index 1");
+                  maybeNs = jsg::JsObject(nsFromSnap);
+                } else {
+                  maybeNs =
+                      tryResolveMainModule(lock, mainModule, *jsContext, *script, limitErrorOrTime);
+                }
+                KJ_IF_SOME(ns, maybeNs) {
                   // To avoid resetting Worker-level C++ handles before snapshotting, we simply do not
                   // create them eagerly. This is safe because the top-level code has already executed,
                   // and the zygote worker will not handle any requests.
@@ -2291,6 +2300,12 @@ Worker::Worker(kj::Own<const Script> scriptParam,
                   //     impl->ctxExports == IsolateBase::workerExportsObj.
                   // A real Worker repopulates these handles in START_FROM_SNAPSHOT mode.
                   if (lock.isPreparingSnapshot()) {
+                    if (script->isModular()) {
+                      auto nsIdx = isolateBase.getSnapshotCreator()->AddData(
+                          context, v8::Local<v8::Object>(ns));
+                      KJ_REQUIRE(
+                          nsIdx == 1, "module namespace must be the second AddData entry", nsIdx);
+                    }
                     break;
                   }
                   impl->env = lock.v8Ref(bindingsScope.As<v8::Value>());
