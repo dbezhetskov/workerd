@@ -24,6 +24,18 @@ struct SnapshotArtifact: public kj::AtomicRefcounted {
   kj::Array<intptr_t> externalReferences;
   size_t externalReferenceCursor = 0;
 
+  // Snapshot index of every resource type's constructor-template slot (memoizedConstructor,
+  // then contextConstructor, per JSG_RESOURCE type), in iterateResourceTypeTemplates order.
+  // kNoConstructorTemplate marks slots that were empty at PREPARE_SNAPSHOT. No key is needed:
+  // the enumeration order is fixed at compile time and the producer and consumers of a
+  // snapshot are the same binary — the same invariant externalReferences already relies on.
+  // Context constructors matter as much as memoized ones: the deserialized global's brand and
+  // the v8::Signature of every snapshot-baked method both reference the zygote's context
+  // constructor; rebuilding it fresh on load would make baked bound methods fail V8's
+  // signature check.
+  static constexpr uint32_t kNoConstructorTemplate = kj::maxValue;
+  kj::Vector<uint32_t> constructorTemplateIndices;
+
   ~SnapshotArtifact() noexcept(false) {
     // v8::SnapshotCreator::CreateBlob() allocates the data with `new[]` and hands over ownership.
     delete[] blob.data;
