@@ -181,6 +181,14 @@ class MessageChannelModule final: public jsg::Object {
   MessageChannelModule() = default;
   MessageChannelModule(jsg::Lock&, const jsg::Url&) {}
 
+  // Stateless module object, safe to recreate for a worker started from a snapshot.
+  bool isSnapshotClonable() const override {
+    return true;
+  }
+  kj::Maybe<kj::Own<jsg::Wrappable>> snapshotClone() const override {
+    return ownAsWrappable(kj::refcounted<MessageChannelModule>());
+  }
+
   JSG_RESOURCE_TYPE(MessageChannelModule) {
     JSG_NESTED_TYPE(MessageChannel);
     JSG_NESTED_TYPE(MessagePort);
