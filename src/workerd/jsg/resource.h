@@ -1831,6 +1831,14 @@ struct NewContextOptions {
   // Used by the per-isolate bootstrap, which needs to capture these constructors
   // (runPerIsolateBootstrap performs the deferred deletion).
   bool deferWeakRefDeletion = false;
+
+  // Install the experimental WebAssembly memory.discard proposal on the new context.
+  bool installWasmMemoryDiscard = false;
+
+  // Threaded through to v8::Context::New() in newContext below. Required when loading
+  // from a startup snapshot whose default context contains aligned-pointer internal
+  // fields that need the embedder to reattach C++ state.
+  v8::DeserializeInternalFieldsCallback internalFieldsDeserializer;
 };
 
 void deleteWeakRefGlobals(v8::Isolate* isolate, v8::Local<v8::Context> context);
@@ -1964,7 +1972,8 @@ class ResourceWrapper {
 
     auto isolate = js.v8Isolate;
     auto tmpl = getTemplate<true>(isolate, nullptr)->InstanceTemplate();
-    v8::Local<v8::Context> context = v8::Context::New(isolate, nullptr, tmpl);
+    v8::Local<v8::Context> context = v8::Context::New(isolate, /*extensions=*/nullptr, tmpl,
+        /*global_object=*/v8::MaybeLocal<v8::Value>(), options.internalFieldsDeserializer);
     auto global = context->Global();
 
     auto ptr = js.alloc<T>(kj::fwd<Args>(args)...);
