@@ -129,6 +129,14 @@ class Tracing: public jsg::Object {
   Tracing() = default;
   Tracing(jsg::Lock&, const jsg::Url&) {}
 
+  // Stateless module object, safe to recreate for a worker started from a snapshot.
+  bool isSnapshotClonable() const override {
+    return true;
+  }
+  kj::Maybe<kj::Own<jsg::Wrappable>> snapshotClone() const override {
+    return ownAsWrappable(kj::refcounted<Tracing>());
+  }
+
   // Creates a new child span of the current user trace span, pushes it onto the
   // AsyncContextFrame as the active user span, invokes callback(span, ...args), and
   // automatically ends the span on completion. If the callback returns a Promise, the
