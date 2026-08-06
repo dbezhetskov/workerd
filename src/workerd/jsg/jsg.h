@@ -81,6 +81,10 @@ struct SnapshotArtifact: public kj::AtomicRefcounted {
   static constexpr uint32_t kNoConstructorTemplate = kj::maxValue;
   kj::Vector<uint32_t> constructorTemplateIndices;
 
+  // Wrappables that must outlive the worker they originated from.
+  // Each worker created from this artifact gets a fresh snapshotClone() of one Wrappable.
+  kj::Vector<kj::Own<Wrappable>> liveWrappables;
+
   ~SnapshotArtifact() noexcept(false) {
     // v8::SnapshotCreator::CreateBlob() allocates the data with `new[]` and hands over ownership.
     delete[] blob.data;

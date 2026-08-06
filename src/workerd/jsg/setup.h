@@ -95,6 +95,25 @@ class V8System {
       JitCodeEventTracking);
 };
 
+// Filled by snapshotDeserializeInternalFields() during Context::New()-from-snapshot. The
+// holder Local is only valid inside the callback and attachWrapper() cannot run in the
+// middle of context deserialization because it can allocate new objects, so the entries are
+// replayed by IsolateBase::applyPendingInternalFieldRestores() after Context::New() returns.
+struct PendingInternalFieldRestores {
+  struct Entry {
+    v8::Global<v8::Object> holder;
+    uint32_t originalIndex;
+  };
+  kj::Vector<Entry> entries;
+};
+
+// DeserializeInternalFieldsCallback. Called by V8 inside Context::New() while restoring the
+// default context graph. For workerd Wrappable wrappers it restores the WORKERD_WRAPPABLE_TAG,
+// pins the Wrappable* slot to nullptr, and records the wrapper + its liveWrappables index
+// into the PendingInternalFieldRestores passed as `data`.
+void snapshotDeserializeInternalFields(
+    v8::Local<v8::Object> holder, int index, v8::StartupData payload, void* data);
+
 // Base class of Isolate<T> containing parts that don't need to be templated, to avoid code
 // bloat.
 class IsolateBase {
@@ -424,6 +443,12 @@ class IsolateBase {
   // When preparing a snapshot: serialize the isolate with `defaultContextHandle` as the default
   // context and fill the SnapshotArtifact slot passed at isolate creation. No-op otherwise.
   void prepareSnapshot(v8::Global<v8::Context> defaultContextHandle);
+
+  // Replays the entries collected by snapshotDeserializeInternalFields() once Context::New()
+  // has returned: clones each artifact original and attaches the clone to its snapshot-restored
+  // wrapper. Runs before any script executes in the new context, so no code can observe a
+  // wrapper with a null backing. No-op when `pending` is empty.
+  void applyPendingInternalFieldRestores(PendingInternalFieldRestores& pending);
 
   void registerExternalReference(intptr_t addr) {
     if (!isPreparingSnapshot()) return;
@@ -1096,6 +1121,11 @@ class Isolate: public IsolateBase {
       // TODO(soon): Requiring move semantics for the global object is awkward. This should instead
       //   allocate the object (forwarding arguments to the constructor) and return something like
       //   a Ref.
+      PendingInternalFieldRestores pendingInternalFieldRestores;
+      if (jsgIsolate.isStartingFromSnapshot()) {
+        options.internalFieldsDeserializer = v8::DeserializeInternalFieldsCallback(
+            &snapshotDeserializeInternalFields, &pendingInternalFieldRestores);
+      }
       auto context = wrapper->newContext(*this, options, jsgIsolate.getObserver(),
           static_cast<T*>(nullptr), kj::fwd<Args>(args)...);
       jsg::setAlignedPointerInEmbedderData(
@@ -1105,6 +1135,8 @@ class Isolate: public IsolateBase {
         v8::Context::Scope scope(handle);
         installWasmMemoryDiscard();
       }
+
+      jsgIsolate.applyPendingInternalFieldRestores(pendingInternalFieldRestores);
       return context;
     }
 

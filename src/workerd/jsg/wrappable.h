@@ -311,6 +311,23 @@ class Wrappable: public kj::Refcounted {
   // (Typically, the caller will ignore the return value, thus dropping the reference.)
   kj::Own<Wrappable> detachWrapper(bool shouldFreelistShim);
 
+  // Cheap clonability check paired with snapshotClone(). Must return true iff
+  // snapshotClone() returns non-none. Used during PREPARE_SNAPSHOT (inside V8's
+  // SerializeInternalFieldsCallback) to validate reachable wrappers without constructing a
+  // throwaway clone.
+  virtual bool isSnapshotClonable() const {
+    return false;
+  }
+
+  // Override in subclasses that want to survive a V8 startup snapshot. Must return a deep,
+  // isolate-independent copy: no V8 handles, no jsg::Ref<T> members, no IoContext/IO refs.
+  // Called on the original stored in the SnapshotArtifact once per worker started from the
+  // snapshot. At that point the zygote isolate is already gone, so the implementation must
+  // only touch plain C++ state.
+  virtual kj::Maybe<kj::Own<Wrappable>> snapshotClone() const {
+    return kj::none;
+  }
+
   // Called by HeapTracer when V8 tells us that it found a reference to this object.
   void traceFromV8(cppgc::Visitor& cppgcVisitor);
 
