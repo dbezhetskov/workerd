@@ -505,6 +505,109 @@ IsolateBase::IsolateBase(V8System& system,
   });
 }
 
+namespace {
+
+// Snapshot internal-fields payload: a uint32_t index into SnapshotArtifact::liveWrappables.
+constexpr size_t kSnapshotPayloadBytes = sizeof(uint32_t);
+
+// Collects the native backing objects of the wrappers V8 serializes into the snapshot blob.
+// Each Wrappable gets one entry keyed by address: the Own keeps the original alive until it
+// moves into SnapshotArtifact::liveWrappables after CreateBlob(), and `index` is its position
+// there (emitted as the internal-fields payload). Types whose isClonable() returns false are
+// recorded and rejected after CreateBlob() returns.
+struct WrappableCollector {
+  struct WrappableRecord {
+    kj::Own<Wrappable> ref;
+    uint32_t index;
+  };
+  kj::HashMap<Wrappable*, WrappableRecord> records;
+  kj::Vector<kj::String> unclonable;
+};
+
+// SerializeInternalFieldsCallback. Called by V8 during CreateBlob() for every aligned
+// pointer internal field of every reachable v8::Object. For each
+// workerd wrapper, validates clonability via isSnapshotClonable(), stores the original
+// Wrappable in the collector, and emits its index as the payload.
+v8::StartupData serializeInternalFieldsForSnapshot(
+    v8::Local<v8::Object> holder, int index, void* data) {
+  if (index == Wrappable::WRAPPABLE_TAG_FIELD_INDEX) {
+    return {nullptr, 0};
+  }
+  KJ_REQUIRE(index == Wrappable::WRAPPED_OBJECT_FIELD_INDEX);
+  if (!Wrappable::isWorkerdApiObject(holder)) {
+    return {nullptr, 0};
+  }
+  auto* wrappable = static_cast<Wrappable*>(
+      holder->GetAlignedPointerFromInternalField(Wrappable::WRAPPED_OBJECT_FIELD_INDEX,
+          static_cast<v8::EmbedderDataTypeTag>(Wrappable::WRAPPED_OBJECT_FIELD_INDEX)));
+  if (wrappable == nullptr) {
+    return {nullptr, 0};
+  }
+  auto& collector = *static_cast<WrappableCollector*>(data);
+  if (!wrappable->isSnapshotClonable()) {
+    collector.unclonable.add(kj::str(wrappable->jsgGetMemoryName()));
+    return {nullptr, 0};
+  }
+  uint32_t originalIndex = collector.records
+                               .findOrCreate(wrappable, [&]() {
+    return decltype(collector.records)::Entry{
+      wrappable, {kj::addRef(*wrappable), static_cast<uint32_t>(collector.records.size())}};
+  }).index;
+  // V8 takes ownership of the returned buffer and frees it via delete[].
+  char* buf = new char[kSnapshotPayloadBytes];
+  // Since we are inside one process we don't need to care about the format of uint32_t
+  // but it should be revised in case of different processes/architectures.
+  memcpy(buf, &originalIndex, kSnapshotPayloadBytes);
+  return v8::StartupData{buf, static_cast<int>(kSnapshotPayloadBytes)};
+}
+
+}  // namespace
+
+void snapshotDeserializeInternalFields(
+    v8::Local<v8::Object> holder, int index, v8::StartupData payload, void* data) {
+  if (index == Wrappable::WRAPPABLE_TAG_FIELD_INDEX) {
+    auto* tagPtr = const_cast<uint16_t*>(&Wrappable::WORKERD_WRAPPABLE_TAG);
+    holder->SetAlignedPointerInInternalField(Wrappable::WRAPPABLE_TAG_FIELD_INDEX, tagPtr,
+        static_cast<v8::EmbedderDataTypeTag>(Wrappable::WRAPPABLE_TAG_FIELD_INDEX));
+    return;
+  }
+  KJ_REQUIRE(index == Wrappable::WRAPPED_OBJECT_FIELD_INDEX);
+  if (payload.raw_size < static_cast<int>(kSnapshotPayloadBytes)) {
+    return;
+  }
+  holder->SetAlignedPointerInInternalField(Wrappable::WRAPPED_OBJECT_FIELD_INDEX, nullptr,
+      static_cast<v8::EmbedderDataTypeTag>(Wrappable::WRAPPED_OBJECT_FIELD_INDEX));
+  KJ_REQUIRE(
+      data != nullptr, "snapshot context deserialization requires PendingInternalFieldRestores");
+  auto& pending = *static_cast<PendingInternalFieldRestores*>(data);
+  uint32_t originalIndex;
+  static_assert(sizeof(originalIndex) == kSnapshotPayloadBytes);
+  memcpy(&originalIndex, payload.data, kSnapshotPayloadBytes);
+  pending.entries.add(PendingInternalFieldRestores::Entry{
+    .holder = v8::Global<v8::Object>(v8::Isolate::GetCurrent(), holder),
+    .originalIndex = originalIndex,
+  });
+}
+
+void IsolateBase::applyPendingInternalFieldRestores(PendingInternalFieldRestores& pending) {
+  if (pending.entries.size() == 0) return;
+  KJ_REQUIRE(isStartingFromSnapshot(),
+      "Internal fields deserialization can happen only with enabled snapshot");
+  auto& artifact = KJ_ASSERT_NONNULL(
+      getSnapshotArtifact(), "START_FROM_SNAPSHOT isolate has no SnapshotArtifact");
+  for (auto& entry: pending.entries) {
+    KJ_REQUIRE(entry.originalIndex < artifact.liveWrappables.size(),
+        "snapshot native-original index out of range", entry.originalIndex);
+    auto& original = artifact.liveWrappables[entry.originalIndex];
+    auto fresh = KJ_ASSERT_NONNULL(original->snapshotClone(), "artifact original failed to clone",
+        original->jsgGetMemoryName());
+    fresh->attachWrapper(ptr, entry.holder.Get(ptr), true);
+    // `fresh` drops here: the CppgcShim created by attachWrapper() holds its own
+    // ref, so the clone now lives exactly as long as its wrapper, like any
+    // normally-created resource object.
+  }
+}
+
 void IsolateBase::prepareSnapshot(v8::Global<v8::Context> defaultContextHandle) {
   KJ_REQUIRE(mode == IsolateMode::PREPARE_SNAPSHOT);
   // PREPARE_SNAPSHOT mode implies the isolate was constructed with a PRODUCE-mode artifact,
@@ -519,7 +622,14 @@ void IsolateBase::prepareSnapshot(v8::Global<v8::Context> defaultContextHandle) 
   auto snapshotKeepalives = heapTracer.resetLiveWrappableInstances();
 
   auto defaultContext = defaultContextHandle.Get(ptr);
-  creator->SetDefaultContext(defaultContext);
+
+  // Wrapper objects carry aligned internal-field pointers: WORKERD_WRAPPABLE_TAG +
+  // Wrappable*. The serialize callback replaces each Wrappable* with a uint32 index
+  // into the collector, whose records move into SnapshotArtifact::liveWrappables
+  // after CreateBlob() below.
+  WrappableCollector collector;
+  v8::SerializeInternalFieldsCallback serializeCb(&serializeInternalFieldsForSnapshot, &collector);
+  creator->SetDefaultContext(defaultContext, serializeCb);
   KJ_DASSERT(artifact.blob.data == nullptr, "snapshot artifact already holds a blob");
 
   // We need to reset all C++ handles that point to JavaScript objects before creating
@@ -562,6 +672,18 @@ void IsolateBase::prepareSnapshot(v8::Global<v8::Context> defaultContextHandle) 
   defaultContextHandle.Reset();
 
   artifact.blob = creator->CreateBlob(v8::SnapshotCreator::FunctionCodeHandling::kClear);
+
+  KJ_REQUIRE(collector.unclonable.empty(),
+      "PREPARE_SNAPSHOT: live wrapper types without a snapshotClone() implementation "
+      "were reachable from the context; these types cannot be transferred through the "
+      "startup snapshot",
+      collector.unclonable);
+  // Materialize the dense index-addressed vector the LOAD side expects. Indices were assigned
+  // as 0..size-1 with no gaps, so every slot gets filled.
+  artifact.liveWrappables.resize(collector.records.size());
+  for (auto& entry: collector.records) {
+    artifact.liveWrappables[entry.value.index] = kj::mv(entry.value.ref);
+  }
 }
 
 IsolateBase::~IsolateBase() noexcept(false) {

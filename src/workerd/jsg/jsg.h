@@ -84,6 +84,9 @@ struct SnapshotArtifact {
   // signature check.
   static constexpr uint32_t kNoConstructorTemplate = kj::maxValue;
   kj::Vector<uint32_t> constructorTemplateIndices;
+  // Wrappables that must outlive the worker they originated from.
+  // Each worker created from this artifact gets a fresh snapshotClone() of one Wrappable.
+  kj::Vector<kj::Own<Wrappable>> liveWrappables;
   Mode mode;
 };
 
