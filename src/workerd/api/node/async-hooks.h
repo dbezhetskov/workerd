@@ -251,6 +251,14 @@ class AsyncHooksModule final: public jsg::Object {
   AsyncHooksModule() = default;
   AsyncHooksModule(jsg::Lock&, const jsg::Url&) {}
 
+  // Stateless module object, safe to recreate for a worker started from a snapshot.
+  bool isSnapshotClonable() const override {
+    return true;
+  }
+  kj::Maybe<kj::Own<jsg::Wrappable>> snapshotClone() const override {
+    return ownAsWrappable(kj::refcounted<AsyncHooksModule>());
+  }
+
   JSG_RESOURCE_TYPE(AsyncHooksModule) {
     JSG_NESTED_TYPE(AsyncLocalStorage);
     JSG_NESTED_TYPE(AsyncResource);

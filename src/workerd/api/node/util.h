@@ -165,6 +165,14 @@ class UtilModule final: public jsg::Object {
   UtilModule() = default;
   UtilModule(jsg::Lock&, const jsg::Url&) {}
 
+  // Stateless module object, safe to recreate for a worker started from a snapshot.
+  bool isSnapshotClonable() const override {
+    return true;
+  }
+  kj::Maybe<kj::Own<jsg::Wrappable>> snapshotClone() const override {
+    return ownAsWrappable(kj::refcounted<UtilModule>());
+  }
+
   jsg::Name getResourceTypeInspect(jsg::Lock& js);
 
   // `getOwnNonIndexProperties()` `filter`s

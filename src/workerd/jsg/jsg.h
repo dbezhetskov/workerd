@@ -1437,6 +1437,18 @@ class Object: private Wrappable {
   template <typename T>
   WeakRef<T> getWeakRefToThis(Lock& js);
 
+  // Upcasts an owned resource object to its Wrappable base, for returning from
+  // snapshotClone() overrides. Lives on Object because Wrappable is a private base:
+  // the pointer conversion is only accessible to Object and its friends. The implicit
+  // Own<T> -> Own<Wrappable> conversion doesn't work even here (kj::Own checks
+  // convertibility in kj's context), so take a fresh ref as Wrappable and drop the
+  // typed one — the refcount ends back at 1.
+  template <typename T>
+  static kj::Own<Wrappable> ownAsWrappable(kj::Own<T> obj) {
+    Wrappable& wrappable = *static_cast<Object*>(obj.get());
+    return kj::addRef(wrappable);
+  }
+
  private:
   inline void visitForMemoryInfo(MemoryTracker& tracker) const {}
   inline void visitForGc(GcVisitor& visitor) {}
