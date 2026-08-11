@@ -503,9 +503,23 @@ public:
     return js.alloc<ByteLengthQueuingStrategy>(init);
   }
 
+  // Only trivial state (the highWaterMark), safe to recreate for a worker started from a
+  // snapshot.
+  bool isSnapshotClonable() const override {
+    return true;
+  }
+  kj::Maybe<kj::Own<jsg::Wrappable>> snapshotClone() const override {
+    return ownAsWrappable(kj::refcounted<ByteLengthQueuingStrategy>(init));
+  }
+
   double getHighWaterMark() const { return init.highWaterMark; }
 
-  jsg::Function<QueuingStrategySizeFunction> getSize() const { return &size; }
+  jsg::JsValue getSize(jsg::Lock& js) const;
+
+  // Static trampoline for the `size` property function. It carries no `data` at all, so size
+  // functions created while preparing a startup snapshot serialize cleanly. The address is
+  // registered as a V8 external reference in the Worker::Isolate constructor.
+  static void sizeCallback(const v8::FunctionCallbackInfo<v8::Value>& info);
 
   JSG_RESOURCE_TYPE(ByteLengthQueuingStrategy) {
     JSG_READONLY_PROTOTYPE_PROPERTY(highWaterMark, getHighWaterMark);
@@ -533,9 +547,23 @@ public:
     return js.alloc<CountQueuingStrategy>(init);
   }
 
+  // Only trivial state (the highWaterMark), safe to recreate for a worker started from a
+  // snapshot.
+  bool isSnapshotClonable() const override {
+    return true;
+  }
+  kj::Maybe<kj::Own<jsg::Wrappable>> snapshotClone() const override {
+    return ownAsWrappable(kj::refcounted<CountQueuingStrategy>(init));
+  }
+
   double getHighWaterMark() const { return init.highWaterMark; }
 
-  jsg::Function<QueuingStrategySizeFunction> getSize() const { return &size; }
+  jsg::JsValue getSize(jsg::Lock& js) const;
+
+  // Static trampoline for the `size` property function (always returns 1). It carries no `data`
+  // at all, so size functions created while preparing a startup snapshot serialize cleanly. The
+  // address is registered as a V8 external reference in the Worker::Isolate constructor.
+  static void sizeCallback(const v8::FunctionCallbackInfo<v8::Value>& info);
 
   JSG_RESOURCE_TYPE(CountQueuingStrategy) {
     JSG_READONLY_PROTOTYPE_PROPERTY(highWaterMark, getHighWaterMark);
@@ -548,10 +576,6 @@ public:
   }
 
 private:
-  static jsg::Optional<uint32_t> size(jsg::Lock& js, jsg::Optional<jsg::JsValue>) {
-    return 1;
-  }
-
   QueuingStrategyInit init;
 };
 

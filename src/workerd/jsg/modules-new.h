@@ -810,4 +810,12 @@ constexpr ModuleRegistry::Builder::Options operator&(
       static_cast<uint8_t>(a) & static_cast<uint8_t>(b));
 }
 
+// Returns the static trampoline backing require() functions created by node:module's
+// createRequire() (new module registry). The referrer URL travels as the require function's
+// `data` (a plain JS string), so the function carries no embedder-owned state. Its address
+// must be registered in the V8 external_references array: require functions created in the
+// zygote live in the JS heap and are serialized into the snapshot. The callback itself lives
+// in an anonymous namespace in modules-new.c++, hence this accessor.
+v8::FunctionCallback getRequireCallback();
+
 }  // namespace workerd::jsg::modules

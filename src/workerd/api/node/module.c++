@@ -23,24 +23,10 @@ jsg::JsValue ModuleUtil::createRequire(jsg::Lock& js, kj::String path) {
       "a file URL string, or an absolute path string.");
 
   if (FeatureFlags::get(js).getNewModuleRegistry()) {
-    return jsg::JsValue(js.wrapReturningFunction(js.v8Context(),
-        [referrer = parsed.clone()](jsg::Lock& js,
-            const v8::FunctionCallbackInfo<v8::Value>& args) -> v8::Local<v8::Value> {
-      auto specifier = kj::str(args[0]);
-      if (jsg::isNodeJsCompatEnabled(js)) {
-        KJ_IF_SOME(nodeSpec, jsg::checkNodeSpecifier(specifier)) {
-          specifier = kj::mv(nodeSpec);
-        }
-      }
-      KJ_IF_SOME(val,
-          jsg::modules::ModuleRegistry::tryResolveModuleNamespace(js, specifier,
-              jsg::modules::ResolveContext::Type::BUNDLE,
-              jsg::modules::ResolveContext::Source::REQUIRE, referrer,
-              jsg::modules::UnwrapDefault::YES)) {
-        return val;
-      }
-      JSG_FAIL_REQUIRE(Error, kj::str("Module not found: ", specifier));
-    }));
+    // The require logic lives in a static trampoline (registered as a V8 external reference);
+    // the referrer travels as the function's `data` so the function is snapshot-serializable.
+    return jsg::JsValue(jsg::check(v8::Function::New(js.v8Context(),
+        jsg::modules::getRequireCallback(), v8::Local<v8::String>(js.str(parsed.getHref())))));
   }
 
   // We do not currently handle specifiers as URLs, so let's treat any
@@ -53,64 +39,10 @@ jsg::JsValue ModuleUtil::createRequire(jsg::Lock& js, kj::String path) {
   // The specifier must be a file: URL
   JSG_REQUIRE(parsed.getProtocol() == "file:"_kj, TypeError, "The specifier must be a file: URL.");
 
-  return jsg::JsValue(js.wrapReturningFunction(js.v8Context(),
-      [referrer = kj::str(parsed.getPathname())](
-          jsg::Lock& js, const v8::FunctionCallbackInfo<v8::Value>& args) -> v8::Local<v8::Value> {
-    auto registry = jsg::ModuleRegistry::from(js);
-
-    // TODO(soon): This will need to be updated to support the new module registry
-    // when that is fully implemented.
-    JSG_REQUIRE(registry != nullptr, Error, "Module registry not available.");
-
-    auto ref = ([&] {
-      try {
-        return kj::Path::parse(referrer.slice(1));
-      } catch (kj::Exception& e) {
-        JSG_FAIL_REQUIRE(Error, kj::str("Invalid referrer path: ", referrer.slice(1)));
-      }
-    })();
-
-    auto spec = kj::str(args[0]);
-
-    if (jsg::isNodeJsCompatEnabled(js)) {
-      KJ_IF_SOME(nodeSpec, jsg::checkNodeSpecifier(spec)) {
-        spec = kj::mv(nodeSpec);
-      }
-    }
-
-    static const kj::Path kRoot = kj::Path::parse("");
-
-    kj::Path targetPath = ([&] {
-      // If the specifier begins with one of our known prefixes, let's not resolve
-      // it against the referrer.
-      try {
-        if (spec.startsWith("node:") || spec.startsWith("cloudflare:") ||
-            spec.startsWith("workerd:")) {
-          return kj::Path::parse(spec);
-        }
-
-        return ref == kRoot ? kj::Path::parse(spec) : ref.parent().eval(spec);
-      } catch (kj::Exception&) {
-        JSG_FAIL_REQUIRE(Error, kj::str("Invalid specifier path: ", spec));
-      }
-    })();
-
-    // require() is only exposed to worker bundle modules so the resolve here is only
-    // permitted to require worker bundle or built-in modules. Internal modules are
-    // excluded.
-    auto& info = JSG_REQUIRE_NONNULL(
-        registry->resolve(js, targetPath, ref, jsg::ModuleRegistry::ResolveOption::DEFAULT,
-            jsg::ModuleRegistry::ResolveMethod::REQUIRE, spec.asPtr()),
-        Error, "No such module \"", targetPath.toString(), "\".");
-
-    jsg::ModuleRegistry::RequireImplOptions options =
-        jsg::ModuleRegistry::RequireImplOptions::DEFAULT;
-    if (info.maybeSynthetic != kj::none) {
-      options = jsg::ModuleRegistry::RequireImplOptions::EXPORT_DEFAULT;
-    }
-
-    return jsg::ModuleRegistry::requireImpl(js, info, options);
-  }));
+  // The require logic lives in a static trampoline (registered as a V8 external reference);
+  // the referrer travels as the function's `data` so the function is snapshot-serializable.
+  return jsg::JsValue(jsg::check(v8::Function::New(js.v8Context(), jsg::getLegacyRequireCallback(),
+      v8::Local<v8::String>(js.str(parsed.getPathname())))));
 }
 
 }  // namespace workerd::api::node

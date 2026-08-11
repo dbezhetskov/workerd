@@ -8,7 +8,8 @@
 #include <workerd/api/actor-state.h>
 #include <workerd/api/global-scope.h>
 #include <workerd/api/sockets.h>
-#include <workerd/api/streams/common.h>  // for api::StreamEncoding
+#include <workerd/api/streams/common.h>    // for api::StreamEncoding
+#include <workerd/api/streams/readable.h>  // for the queuing-strategy size callbacks
 #include <workerd/io/actor-sqlite.h>
 #include <workerd/io/cdp.capnp.h>
 #include <workerd/io/compatibility-date.h>
@@ -17,6 +18,7 @@
 #include <workerd/io/per-isolate-bootstrap.h>
 #include <workerd/io/tracer.h>
 #include <workerd/io/wasm-instantiate-shim.embed.h>
+#include <workerd/io/worker-fs.h>
 #include <workerd/io/worker.h>
 #include <workerd/jsg/async-context.h>
 #include <workerd/jsg/inspector.h>
@@ -1176,6 +1178,19 @@ Worker::Isolate::Isolate(kj::Own<Api> apiParam,
           lock->v8Isolate, reinterpret_cast<intptr_t>(m.callback));
     }
     jsg::isolateRegisterExternalReference(lock->v8Isolate, jsg::getSyntheticModuleEvalRef());
+    // Static trampolines whose v8::Functions carry only JS values as `data` and so may be
+    // legally created while preparing a snapshot; their addresses must resolve at the same
+    // fixed leading indices on SAVE and LOAD.
+    jsg::isolateRegisterExternalReference(lock->v8Isolate, api::getQueueMicrotaskCallbackRef());
+    jsg::isolateRegisterExternalReference(lock->v8Isolate, getStdioFlushMicrotaskCallbackRef());
+    jsg::isolateRegisterExternalReference(
+        lock->v8Isolate, reinterpret_cast<intptr_t>(jsg::getLegacyRequireCallback()));
+    jsg::isolateRegisterExternalReference(
+        lock->v8Isolate, reinterpret_cast<intptr_t>(jsg::modules::getRequireCallback()));
+    jsg::isolateRegisterExternalReference(
+        lock->v8Isolate, reinterpret_cast<intptr_t>(&api::ByteLengthQueuingStrategy::sizeCallback));
+    jsg::isolateRegisterExternalReference(
+        lock->v8Isolate, reinterpret_cast<intptr_t>(&api::CountQueuingStrategy::sizeCallback));
 
     lock->setCaptureThrowsAsRejections(features.getCaptureThrowsAsRejections());
     // TODO(cleanup): Now that this list has grown significantly, we should probably

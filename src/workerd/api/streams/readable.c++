@@ -597,6 +597,33 @@ jsg::Ref<ReadableStream> ReadableStream::constructor(jsg::Lock& js,
   return kj::mv(stream);
 }
 
+jsg::JsValue ByteLengthQueuingStrategy::getSize(jsg::Lock& js) const {
+  return jsg::JsValue(jsg::check(v8::Function::New(js.v8Context(), &sizeCallback)));
+}
+
+void ByteLengthQueuingStrategy::sizeCallback(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  jsg::liftKj(info, [&]() -> v8::Local<v8::Value> {
+    auto& js = jsg::Lock::from(info.GetIsolate());
+    jsg::Optional<jsg::JsValue> maybeValue;
+    if (info.Length() > 0) {
+      maybeValue = jsg::JsValue(info[0]);
+    }
+    KJ_IF_SOME(n, size(js, maybeValue)) {
+      return v8::Number::New(js.v8Isolate, n);
+    }
+    return v8::Undefined(js.v8Isolate).As<v8::Value>();
+  });
+}
+
+jsg::JsValue CountQueuingStrategy::getSize(jsg::Lock& js) const {
+  return jsg::JsValue(jsg::check(v8::Function::New(js.v8Context(), &sizeCallback)));
+}
+
+void CountQueuingStrategy::sizeCallback(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  // Per the WHATWG Streams spec, CountQueuingStrategy.size always returns 1.
+  info.GetReturnValue().Set(1);
+}
+
 jsg::Optional<uint32_t> ByteLengthQueuingStrategy::size(
     jsg::Lock& js, jsg::Optional<jsg::JsValue> maybeValue) {
   KJ_IF_SOME(value, maybeValue) {

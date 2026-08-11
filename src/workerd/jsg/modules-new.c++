@@ -2077,4 +2077,38 @@ Function<void()> Module::compileEvalFunction(Lock& js,
   };
 }
 
+namespace {
+
+// Static trampoline backing the require() function returned by node:module's createRequire()
+// (new module registry). The referrer URL travels as the created function's `data` (a plain JS
+// string) and the registry is resolved from the context at call time, so the require function
+// carries no embedder-owned state and can be serialized into a startup snapshot. The address is
+// registered as a V8 external reference in the Worker::Isolate constructor (via
+// getRequireCallbackRef).
+void requireCallback(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  liftKj(info, [&]() -> v8::Local<v8::Value> {
+    auto& js = Lock::from(info.GetIsolate());
+    auto referrer = KJ_ASSERT_NONNULL(Url::tryParse(kj::str(info.Data()).asPtr()));
+
+    auto specifier = kj::str(info[0]);
+    if (isNodeJsCompatEnabled(js)) {
+      KJ_IF_SOME(nodeSpec, checkNodeSpecifier(specifier)) {
+        specifier = kj::mv(nodeSpec);
+      }
+    }
+    KJ_IF_SOME(val,
+        ModuleRegistry::tryResolveModuleNamespace(js, specifier, ResolveContext::Type::BUNDLE,
+            ResolveContext::Source::REQUIRE, referrer, UnwrapDefault::YES)) {
+      return val;
+    }
+    JSG_FAIL_REQUIRE(Error, kj::str("Module not found: ", specifier));
+  });
+}
+
+}  // namespace
+
+v8::FunctionCallback getRequireCallback() {
+  return &requireCallback;
+}
+
 }  // namespace workerd::jsg::modules
