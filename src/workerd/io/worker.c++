@@ -1581,6 +1581,43 @@ Worker::Script::Script(kj::Own<const Isolate> isolateParam,
                   impl->configureDynamicImports(lock, *jsg::ModuleRegistry::from(lock));
                   isolate->getApi().compileModules(
                       lock, modulesSource, *isolate, kj::mv(artifacts), parentSpan.addRef());
+
+                  // Overwrite the freshly re-registered entries with the module instances baked
+                  // into the context snapshot. compileModules() must still run first: it
+                  // registers the builtin source/callback entries that stay lazily compilable
+                  // for modules the zygote never touched, and materialization rebuilds C++
+                  // state (CJS providers, capnp scopes) that the snapshot cannot carry. Without
+                  // this pass the baked main-module graph and runtime import()/require() yield
+                  // two module graphs (e.g. two Buffer.prototype identities).
+                  if (lock.isStartingFromSnapshot()) {
+                    auto& isolateBase = jsg::IsolateBase::from(lock.v8Isolate);
+                    auto& artifact = KJ_ASSERT_NONNULL(isolateBase.getSnapshotArtifact(),
+                        "START_FROM_SNAPSHOT isolate has no SnapshotArtifact");
+                    auto* registry = jsg::ModuleRegistry::from(js);
+                    const bool hasFallback = isolateBase.tryGetModuleFallback() != kj::none;
+                    for (auto& rec: artifact.moduleRecords) {
+                      v8::Local<v8::Data> data;
+                      KJ_REQUIRE(
+                          context->GetDataFromSnapshotOnce<v8::Data>(rec.dataIndex).ToLocal(&data),
+                          "START_FROM_SNAPSHOT: module snapshot data missing", rec.specifier,
+                          rec.dataIndex);
+                      bool found = registry->restoreSnapshotEntry(js, rec.specifier,
+                          static_cast<jsg::ModuleRegistry::Type>(rec.moduleType),
+                          static_cast<jsg::ModuleRegistry::SnapshotHandleKind>(rec.handleKind),
+                          data);
+                      if (!found) {
+                        // Only fallback-service modules are registered lazily at resolve time
+                        // and can legitimately be absent after compileModules().
+                        KJ_REQUIRE(hasFallback,
+                            "START_FROM_SNAPSHOT: pinned module has no registry entry",
+                            rec.specifier);
+                        KJ_LOG(WARNING,
+                            "module fallback entry not restored from snapshot; identity with "
+                            "the baked graph is broken for it",
+                            rec.specifier);
+                      }
+                    }
+                  }
                 }
                 impl->unboundScriptOrMainModule = kj::Path::parse(modulesSource.mainModule);
               }

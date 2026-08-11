@@ -87,6 +87,20 @@ struct SnapshotArtifact {
   // Wrappables that must outlive the worker they originated from.
   // Each worker created from this artifact gets a fresh snapshotClone() of one Wrappable.
   kj::Vector<kj::Own<Wrappable>> liveWrappables;
+  // Module-registry handles pinned into the snapshot at PREPARE_SNAPSHOT so the loading worker
+  // can overwrite its freshly re-registered entries with the baked module instances (preserving
+  // identity between the baked main-module graph and runtime import()/require()). Field types
+  // are raw ints to avoid coupling this header to modules.h: moduleType is a
+  // jsg::ModuleRegistry::Type (capnp ModuleType), handleKind is a
+  // jsg::ModuleRegistry::SnapshotHandleKind, dataIndex is a context-level
+  // SnapshotCreator::AddData index.
+  struct ModuleRecord {
+    kj::String specifier;
+    uint8_t moduleType;
+    uint8_t handleKind;
+    uint32_t dataIndex;
+  };
+  kj::Vector<ModuleRecord> moduleRecords;
   Mode mode;
 };
 

@@ -237,8 +237,45 @@ class ModuleRegistry {
 
   virtual void setDynamicImportCallback(kj::Function<DynamicImportCallback> func) = 0;
 
-  // Visit all v8::Global handles owned by instantiated module entries.
-  virtual void visitHandlesForSnapshot(kj::FunctionParam<void(v8::Global<v8::Data>&)> fn) = 0;
+  // Which handle of a materialized ModuleInfo a SnapshotHandleRef refers to. Handles of kinds
+  // other than INTERNAL_ONLY can be pinned into a startup snapshot (AddData) at PREPARE and
+  // written back via restoreSnapshotEntry() at LOAD, preserving module identity between the
+  // baked main-module graph and runtime import()/require(). INTERNAL_ONLY handles carry
+  // rebuild-on-materialize state (CJS evalFunc internals, capnp scopes) and are reset-only.
+  enum class SnapshotHandleKind : uint8_t {
+    MODULE = 0,                // ModuleInfo::module
+    MODULE_SOURCE_OBJECT = 1,  // ModuleInfo::maybeModuleSourceObject
+    MUTABLE_EXPORTS = 2,       // ModuleInfo::maybeMutableExports (monkey-patched require cache)
+    SYNTHETIC_VALUE = 3,       // ValueModuleInfo::value (Data/Text/Wasm/Json/Object)
+    INTERNAL_ONLY = 255,       // never pinned/recorded, reset-only
+  };
+
+  struct SnapshotHandleRef {
+    const kj::Path& specifier;
+    Type type;
+    SnapshotHandleKind kind;
+    // Status of the owning module; drives the pin policy (kUninstantiated entries leaked no
+    // identity into the baked heap and can safely be recompiled fresh at LOAD).
+    v8::Module::Status status;
+    v8::Global<v8::Data>& handle;
+  };
+
+  // Visit all v8::Global handles owned by materialized module entries, tagged with their
+  // identity (specifier/type/kind). Must be called (and every handle reset) before
+  // SnapshotCreator::CreateBlob(), otherwise V8 reports unserialized global handles. The caller
+  // may AddData-pin a handle before resetting it. Only meaningful for the old module registry;
+  // the new one (modules-new) holds no v8::Global handles directly.
+  virtual void visitEntriesForSnapshot(kj::FunctionParam<void(SnapshotHandleRef)> fn) = 0;
+
+  // At START_FROM_SNAPSHOT, overwrite the identified handle of the matching (re-registered and
+  // re-materialized) entry with the snapshot-restored `data`, so resolution returns the baked
+  // module instance instead of a freshly evaluated copy. Returns false if no entry exists for
+  // (specifier, type) — e.g. a fallback-service module registered lazily at resolve time.
+  virtual bool restoreSnapshotEntry(Lock& js,
+      kj::StringPtr specifier,
+      Type type,
+      SnapshotHandleKind kind,
+      v8::Local<v8::Data> data) = 0;
 
   enum class RequireImplOptions {
     // Require returns the module namespace.
@@ -500,54 +537,136 @@ class ModuleRegistryImpl final: public ModuleRegistry {
     return entries.size();
   }
 
-  void visitHandlesForSnapshot(kj::FunctionParam<void(v8::Global<v8::Data>&)> fn) override {
-    visitHandlesForSnapshotImpl(fn);
-  }
-
-  // Visit all v8::Global handles owned by instantiated ModuleInfo entries for V8 snapshot
-  // creation. Also resets tracedHandle on each jsg::Data (via visitHandle()) so V8's snapshot
-  // creator does not report dangling TracedReferences.
-  template <typename Fn>
-  void visitHandlesForSnapshotImpl(Fn&& fn) {
+  // Visit all v8::Global handles owned by materialized ModuleInfo entries for V8 snapshot
+  // creation, tagged with entry identity so the caller can pin them (see base declaration).
+  // Also resets tracedHandle on each jsg::Data (via visitHandle()) so V8's snapshot creator
+  // does not report dangling TracedReferences. Must be called within a handle scope.
+  void visitEntriesForSnapshot(kj::FunctionParam<void(SnapshotHandleRef)> fn) override {
+    auto* isolate = v8::Isolate::GetCurrent();
     for (auto& entry: entries) {
       KJ_IF_SOME(info, entry->info.template tryGet<ModuleInfo>()) {
-        const_cast<ModuleInfo&>(info).module.visitHandle(fn);
-        KJ_IF_SOME(src, const_cast<ModuleInfo&>(info).maybeModuleSourceObject) {
-          src.visitHandle(fn);
+        auto& mutInfo = const_cast<ModuleInfo&>(info);
+        auto emit = [&](SnapshotHandleKind kind, v8::Module::Status status) {
+          return [&fn, &entry, kind, status](v8::Global<v8::Data>& h) {
+            fn(SnapshotHandleRef{
+              .specifier = entry->specifier,
+              .type = entry->type,
+              .kind = kind,
+              .status = status,
+              .handle = h,
+            });
+          };
+        };
+        auto status = v8::Module::kUninstantiated;
+        mutInfo.module.visitHandle([&](v8::Global<v8::Data>& h) {
+          if (!h.IsEmpty()) {
+            status = h.Get(isolate).As<v8::Module>()->GetStatus();
+          }
+          emit(SnapshotHandleKind::MODULE, status)(h);
+        });
+        KJ_IF_SOME(src, mutInfo.maybeModuleSourceObject) {
+          src.visitHandle(emit(SnapshotHandleKind::MODULE_SOURCE_OBJECT, status));
         }
-        KJ_IF_SOME(exp, const_cast<ModuleInfo&>(info).maybeMutableExports) {
-          exp.visitHandle(fn);
+        KJ_IF_SOME(exp, mutInfo.maybeMutableExports) {
+          exp.visitHandle(emit(SnapshotHandleKind::MUTABLE_EXPORTS, status));
         }
-        KJ_IF_SOME(synth, const_cast<ModuleInfo&>(info).maybeSynthetic) {
+        KJ_IF_SOME(synth, mutInfo.maybeSynthetic) {
           KJ_SWITCH_ONEOF(synth) {
             KJ_CASE_ONEOF(cjs, CommonJsModuleInfo) {
-              cjs.evalFunc.visitHandlesForSnapshot(fn);
+              cjs.evalFunc.visitHandlesForSnapshot(emit(SnapshotHandleKind::INTERNAL_ONLY, status));
             }
             KJ_CASE_ONEOF(v, DataModuleInfo) {
-              v.value.visitHandle(fn);
+              v.value.visitHandle(emit(SnapshotHandleKind::SYNTHETIC_VALUE, status));
             }
             KJ_CASE_ONEOF(v, TextModuleInfo) {
-              v.value.visitHandle(fn);
+              v.value.visitHandle(emit(SnapshotHandleKind::SYNTHETIC_VALUE, status));
             }
             KJ_CASE_ONEOF(v, WasmModuleInfo) {
-              v.value.visitHandle(fn);
+              v.value.visitHandle(emit(SnapshotHandleKind::SYNTHETIC_VALUE, status));
             }
             KJ_CASE_ONEOF(v, JsonModuleInfo) {
-              v.value.visitHandle(fn);
+              v.value.visitHandle(emit(SnapshotHandleKind::SYNTHETIC_VALUE, status));
             }
             KJ_CASE_ONEOF(v, ObjectModuleInfo) {
-              v.value.visitHandle(fn);
+              v.value.visitHandle(emit(SnapshotHandleKind::SYNTHETIC_VALUE, status));
             }
             KJ_CASE_ONEOF(v, CapnpModuleInfo) {
-              const_cast<CapnpModuleInfo&>(v).fileScope.visitHandle(fn);
-              for (auto& entry: const_cast<CapnpModuleInfo&>(v).topLevelDecls) {
-                entry.value.visitHandle(fn);
+              auto& capnp = const_cast<CapnpModuleInfo&>(v);
+              capnp.fileScope.visitHandle(emit(SnapshotHandleKind::INTERNAL_ONLY, status));
+              for (auto& decl: capnp.topLevelDecls) {
+                decl.value.visitHandle(emit(SnapshotHandleKind::INTERNAL_ONLY, status));
               }
             }
           }
         }
       }
     }
+  }
+
+  bool restoreSnapshotEntry(Lock& js,
+      kj::StringPtr specifier,
+      Type type,
+      SnapshotHandleKind kind,
+      v8::Local<v8::Data> data) override {
+    auto path = kj::Path::parse(specifier);
+    using Key = typename Entry::Key;
+    auto maybeEntry = entries.find(Key(path, type));
+    KJ_IF_SOME(entry, maybeEntry) {
+      // Materialize the entry the normal way first (no-op for compiled bundle modules; compiles
+      // source builtins; runs the ModuleCallback for callback builtins, rebuilding C++ state
+      // like the CJS provider). Then overwrite the identified handle so resolution returns the
+      // snapshot-baked instance. A restored kEvaluated module short-circuits instantiateModule,
+      // so the freshly built evaluation state is never run again.
+      auto& info = KJ_REQUIRE_NONNULL(entry->module(js, observer, kj::none),
+          "failed to materialize module entry while restoring from snapshot", specifier);
+      switch (kind) {
+        case SnapshotHandleKind::MODULE:
+          info.module = HashableV8Ref<v8::Module>(js.v8Isolate, data.As<v8::Module>());
+          break;
+        case SnapshotHandleKind::MODULE_SOURCE_OBJECT:
+          info.maybeModuleSourceObject =
+              V8Ref<v8::Object>(js.v8Isolate, data.As<v8::Value>().As<v8::Object>());
+          break;
+        case SnapshotHandleKind::MUTABLE_EXPORTS:
+          info.maybeMutableExports =
+              V8Ref<v8::Object>(js.v8Isolate, data.As<v8::Value>().As<v8::Object>());
+          break;
+        case SnapshotHandleKind::SYNTHETIC_VALUE: {
+          auto& synth = KJ_REQUIRE_NONNULL(info.maybeSynthetic,
+              "SYNTHETIC_VALUE recorded for a non-synthetic module", specifier);
+          KJ_SWITCH_ONEOF(synth) {
+            KJ_CASE_ONEOF(v, DataModuleInfo) {
+              v.value =
+                  V8Ref<v8::ArrayBuffer>(js.v8Isolate, data.As<v8::Value>().As<v8::ArrayBuffer>());
+            }
+            KJ_CASE_ONEOF(v, TextModuleInfo) {
+              v.value = V8Ref<v8::String>(js.v8Isolate, data.As<v8::Value>().As<v8::String>());
+            }
+            KJ_CASE_ONEOF(v, WasmModuleInfo) {
+              v.value = V8Ref<v8::WasmModuleObject>(
+                  js.v8Isolate, data.As<v8::Value>().As<v8::WasmModuleObject>());
+            }
+            KJ_CASE_ONEOF(v, JsonModuleInfo) {
+              v.value = V8Ref<v8::Value>(js.v8Isolate, data.As<v8::Value>());
+            }
+            KJ_CASE_ONEOF(v, ObjectModuleInfo) {
+              v.value = V8Ref<v8::Object>(js.v8Isolate, data.As<v8::Value>().As<v8::Object>());
+            }
+            KJ_CASE_ONEOF(cjs, CommonJsModuleInfo) {
+              KJ_FAIL_REQUIRE("SYNTHETIC_VALUE recorded for a CommonJS module", specifier);
+            }
+            KJ_CASE_ONEOF(capnp, CapnpModuleInfo) {
+              KJ_FAIL_REQUIRE("SYNTHETIC_VALUE recorded for a capnp module", specifier);
+            }
+          }
+          break;
+        }
+        case SnapshotHandleKind::INTERNAL_ONLY:
+          KJ_FAIL_REQUIRE("INTERNAL_ONLY handles are never recorded in a snapshot", specifier);
+      }
+      return true;
+    }
+    return false;
   }
 
   Promise<Value> resolveDynamicImport(jsg::Lock& js,
