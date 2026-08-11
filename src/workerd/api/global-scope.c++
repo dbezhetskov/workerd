@@ -1013,41 +1013,66 @@ jsg::JsString ServiceWorkerGlobalScope::atob(jsg::Lock& js, kj::String data) {
   return js.str(decoded.first(result.count));
 }
 
-void ServiceWorkerGlobalScope::queueMicrotask(jsg::Lock& js, jsg::Function<void()> task) {
-  auto fn = js.wrapSimpleFunction(js.v8Context(),
-      JSG_VISITABLE_LAMBDA((this, fn = kj::mv(task)), (fn),
-          (jsg::Lock& js, const v8::FunctionCallbackInfo<v8::Value>& args) {
-            js.tryCatch([&] {
-              // The function won't be called with any arguments, so we can
-              // safely ignore anything passed in to args.
-              fn(js);
-            }, [&](jsg::Value exception) {
-              // The reportError call itself can potentially throw errors. Let's catch
-              // and report them as well.
-              js.tryCatch([&] { reportError(js, jsg::JsValue(exception.getHandle(js))); },
-                  [&](jsg::Value exception) {
-                // An error was thrown by the 'error' event handler. That's unfortunate.
-                // Let's log the error and just continue. It won't be possible to actually
-                // catch or handle this error so logging is really the only way to notify
-                // folks about it.
-                auto val = jsg::JsValue(exception.getHandle(js));
-                // If the value is an object that has a stack property, log that so we get
-                // the stack trace if it is an exception.
-                KJ_IF_SOME(obj, val.tryCast<jsg::JsObject>()) {
-                auto stack = obj.get(js, "stack"_kj);
-                if (!stack.isUndefined()) {
-                js.reportError(stack);
-                return;
-                }
-                } else {
-                }  // Here to avoid a compile warning
-                // Otherwise just log the stringified value generically.
-                js.reportError(val);
-              });
-            });
-          }));
+namespace {
 
+// Static callback for microtasks scheduled via queueMicrotask(). The user's callback travels as
+// the created function's `data` (a plain JS function) and the global scope is recovered from the
+// context at call time, so the microtask function carries no embedder-owned state and can be
+// serialized into a startup snapshot. Its address is registered as a V8 external reference in the
+// Worker::Isolate constructor (via getQueueMicrotaskCallbackRef).
+void queueMicrotaskCallback(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  auto& js = jsg::Lock::from(info.GetIsolate());
+  js.withinHandleScope([&] {
+    auto context = js.v8Context();
+    auto fn = info.Data().As<v8::Function>();
+    js.tryCatch([&] {
+      // The function won't be called with any arguments. The global is used as the receiver to
+      // match the behavior of the jsg::Function-based implementation this replaced.
+      jsg::check(fn->Call(context, context->Global(), 0, nullptr));
+    }, [&](jsg::Value exception) {
+      auto& global =
+          jsg::extractInternalPointer<ServiceWorkerGlobalScope, true>(context, context->Global());
+      // The reportError call itself can potentially throw errors. Let's catch
+      // and report them as well.
+      js.tryCatch([&] { global.reportError(js, jsg::JsValue(exception.getHandle(js))); },
+          [&](jsg::Value exception) {
+        // An error was thrown by the 'error' event handler. That's unfortunate.
+        // Let's log the error and just continue. It won't be possible to actually
+        // catch or handle this error so logging is really the only way to notify
+        // folks about it.
+        auto val = jsg::JsValue(exception.getHandle(js));
+        // If the value is an object that has a stack property, log that so we get
+        // the stack trace if it is an exception.
+        KJ_IF_SOME(obj, val.tryCast<jsg::JsObject>()) {
+          auto stack = obj.get(js, "stack"_kj);
+          if (!stack.isUndefined()) {
+            js.reportError(stack);
+            return;
+          }
+        } else {
+        }  // Here to avoid a compile warning
+        // Otherwise just log the stringified value generically.
+        js.reportError(val);
+      });
+    });
+  });
+}
+
+}  // namespace
+
+void ServiceWorkerGlobalScope::queueMicrotask(jsg::Lock& js, jsg::JsValue task) {
+  // Validated manually to preserve the exact TypeError message the previous
+  // jsg::Function-typed parameter produced (tested by global-scope-test).
+  JSG_REQUIRE(task.isFunction(), TypeError,
+      "Failed to execute 'queueMicrotask' on 'ServiceWorkerGlobalScope': parameter 1 is not of "
+      "type 'function'.");
+  auto fn = jsg::check(
+      v8::Function::New(js.v8Context(), &queueMicrotaskCallback, v8::Local<v8::Value>(task)));
   js.v8Context()->GetMicrotaskQueue()->EnqueueMicrotask(js.v8Isolate, fn);
+}
+
+intptr_t getQueueMicrotaskCallbackRef() {
+  return reinterpret_cast<intptr_t>(&queueMicrotaskCallback);
 }
 
 jsg::JsValue ServiceWorkerGlobalScope::structuredClone(

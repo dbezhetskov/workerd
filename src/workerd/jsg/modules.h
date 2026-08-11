@@ -48,6 +48,14 @@ kj::Maybe<v8::Local<v8::Promise>> instantiateModule(jsg::Lock& js,
 // lives in an anonymous namespace in modules.c++, hence this accessor.
 intptr_t getSyntheticModuleEvalRef();
 
+// Returns the static trampoline backing require() functions created by node:module's
+// createRequire() (original module registry). The referrer path travels as the require
+// function's `data` (a plain JS string), so the function carries no embedder-owned state.
+// Its address must be registered in the V8 external_references array: require functions
+// created in the zygote live in the JS heap and are serialized into the snapshot. The
+// callback itself lives in an anonymous namespace in modules.c++, hence this accessor.
+v8::FunctionCallback getLegacyRequireCallback();
+
 enum class ModuleInfoCompileOption {
   // The BUNDLE options tells the compile operation to treat the content as coming
   // from a worker bundle.

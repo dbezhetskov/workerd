@@ -828,4 +828,9 @@ kj::Rc<Directory> getDevDirectory() KJ_WARN_UNUSED_RESULT;
 kj::Maybe<kj::PathPtr> getCurrentWorkingDirectory() KJ_WARN_UNUSED_RESULT;
 bool setCurrentWorkingDirectory(kj::Path newCwd) KJ_WARN_UNUSED_RESULT;
 
+// Address of the static stdio flush-microtask trampoline callback, for registration as a V8
+// external reference (flush microtask functions created while preparing a startup snapshot may
+// be serialized).
+intptr_t getStdioFlushMicrotaskCallbackRef();
+
 }  // namespace workerd

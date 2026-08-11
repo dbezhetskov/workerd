@@ -440,6 +440,81 @@ intptr_t getSyntheticModuleEvalRef() {
   return reinterpret_cast<intptr_t>(&evaluateSyntheticModuleCallback);
 }
 
+namespace {
+
+// Static trampoline backing the require() function returned by node:module's createRequire()
+// (original module registry). The referrer path travels as the created function's `data` (a
+// plain JS string) and the registry is resolved from the context at call time, so the require
+// function carries no embedder-owned state and can be serialized into a startup snapshot. The
+// address is registered as a V8 external reference in the Worker::Isolate constructor (via
+// getLegacyRequireCallbackRef).
+void legacyRequireCallback(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  liftKj(info, [&]() -> v8::Local<v8::Value> {
+    auto& js = Lock::from(info.GetIsolate());
+    auto referrer = kj::str(info.Data());
+
+    // This trampoline services the original module registry only; when the new
+    // module registry is enabled, createRequire() returns a different
+    // implementation (see modules-new.c++).
+    auto registry = ModuleRegistry::from(js);
+    JSG_REQUIRE(registry != nullptr, Error, "Module registry not available.");
+
+    auto ref = ([&] {
+      try {
+        return kj::Path::parse(referrer.slice(1));
+      } catch (kj::Exception& e) {
+        JSG_FAIL_REQUIRE(Error, kj::str("Invalid referrer path: ", referrer.slice(1)));
+      }
+    })();
+
+    auto spec = kj::str(info[0]);
+
+    if (isNodeJsCompatEnabled(js)) {
+      KJ_IF_SOME(nodeSpec, checkNodeSpecifier(spec)) {
+        spec = kj::mv(nodeSpec);
+      }
+    }
+
+    static const kj::Path kRoot = kj::Path::parse("");
+
+    kj::Path targetPath = ([&] {
+      // If the specifier begins with one of our known prefixes, let's not resolve
+      // it against the referrer.
+      try {
+        if (spec.startsWith("node:") || spec.startsWith("cloudflare:") ||
+            spec.startsWith("workerd:")) {
+          return kj::Path::parse(spec);
+        }
+
+        return ref == kRoot ? kj::Path::parse(spec) : ref.parent().eval(spec);
+      } catch (kj::Exception&) {
+        JSG_FAIL_REQUIRE(Error, kj::str("Invalid specifier path: ", spec));
+      }
+    })();
+
+    // require() is only exposed to worker bundle modules so the resolve here is only
+    // permitted to require worker bundle or built-in modules. Internal modules are
+    // excluded.
+    auto& moduleInfo = JSG_REQUIRE_NONNULL(
+        registry->resolve(js, targetPath, ref, ModuleRegistry::ResolveOption::DEFAULT,
+            ModuleRegistry::ResolveMethod::REQUIRE, spec.asPtr()),
+        Error, "No such module \"", targetPath.toString(), "\".");
+
+    ModuleRegistry::RequireImplOptions options = ModuleRegistry::RequireImplOptions::DEFAULT;
+    if (moduleInfo.maybeSynthetic != kj::none) {
+      options = ModuleRegistry::RequireImplOptions::EXPORT_DEFAULT;
+    }
+
+    return ModuleRegistry::requireImpl(js, moduleInfo, options);
+  });
+}
+
+}  // namespace
+
+v8::FunctionCallback getLegacyRequireCallback() {
+  return &legacyRequireCallback;
+}
+
 ModuleRegistry::ModuleInfo::ModuleInfo(
     jsg::Lock& js, v8::Local<v8::Module> module, kj::Maybe<SyntheticModuleInfo> maybeSynthetic)
     : module(js.v8Isolate, module),

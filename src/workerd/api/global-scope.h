@@ -788,7 +788,7 @@ class ServiceWorkerGlobalScope: public WorkerGlobalScope {
   jsg::JsString btoa(jsg::Lock& js, jsg::JsString data);
   jsg::JsString atob(jsg::Lock& js, kj::String data);
 
-  void queueMicrotask(jsg::Lock& js, jsg::Function<void()> task);
+  void queueMicrotask(jsg::Lock& js, jsg::JsValue task);
 
 #ifdef WORKERD_FUZZILLI
   void fuzzilli(jsg::Lock& js, jsg::Arguments<jsg::Value> args);
@@ -1211,6 +1211,10 @@ class ServiceWorkerGlobalScope: public WorkerGlobalScope {
   // Global properties such as scheduler, crypto, caches, self, and origin should
   // be monkeypatchable / mutable at the global scope.
 };
+
+// Address of the static queueMicrotask trampoline callback, for registration as a V8 external
+// reference (microtask functions created while preparing a startup snapshot may be serialized).
+intptr_t getQueueMicrotaskCallbackRef();
 
 #define EW_GLOBAL_SCOPE_ISOLATE_TYPES                                                              \
   api::WorkerGlobalScope, api::ServiceWorkerGlobalScope, api::TestController,                      \
