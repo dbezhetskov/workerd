@@ -1833,14 +1833,7 @@ void writeStdio(jsg::Lock& js, VirtualFileSystem::Stdio type, kj::ArrayPtr<const
 // logging mechanisms. Reads always return EOF (0-byte reads).
 class StdioFile final: public File {
  public:
-  StdioFile(VirtualFileSystem::Stdio type)
-      : type(type),
-        // TODO(sometime): Investigate if we can refactor out the weakref here?
-        weakThis(kj::rc<WeakRef<StdioFile>>(kj::Badge<StdioFile>(), *this)) {}
-
-  ~StdioFile() noexcept(false) override {
-    weakThis->invalidate();
-  }
+  StdioFile(VirtualFileSystem::Stdio type): type(type) {}
 
   Stat stat(jsg::Lock& js) override {
     return Stat{
@@ -1977,30 +1970,41 @@ class StdioFile final: public File {
   mutable kj::Vector<kj::byte> lineBuffer;
   mutable bool microtaskScheduled = false;
 
-  kj::Rc<WeakRef<StdioFile>> weakThis;
-
   void scheduleFlushMicrotask(jsg::Lock& js) {
     if (microtaskScheduled) return;
     microtaskScheduled = true;
 
-    // Create ephemeral callback with weak reference for safety
-    auto callback = js.wrapSimpleFunction(js.v8Context(),
-        [weakThis = weakThis->addRef()](jsg::Lock& js, const v8::FunctionCallbackInfo<v8::Value>&) {
-      weakThis->runIfAlive([&](StdioFile& self) {
-        self.microtaskScheduled = false;
-
-        if (!self.lineBuffer.empty()) {
-          // SECURITY: Move lineBuffer into a local before calling writeStdio so that
-          // re-entrant writes cannot free the backing store during the call.
-          auto toFlush = kj::mv(self.lineBuffer);
-          self.lineBuffer = kj::Vector<kj::byte>();
-          if (IoContext::hasCurrent()) {
-            writeStdio(js, self.type, toFlush.asPtr());
-          }
-        }
-      });
-    });
+    auto callback = jsg::check(v8::Function::New(js.v8Context(), &flushMicrotaskCallback,
+        v8::Integer::New(js.v8Isolate, static_cast<int32_t>(type))));
     js.v8Context()->GetMicrotaskQueue()->EnqueueMicrotask(js.v8Isolate, callback);
+  }
+
+ public:
+  // Static trampoline for the flush microtask. The stdio stream id travels as the function's
+  // `data` (a plain JS number) and the StdioFile instance is re-resolved from the worker's
+  // VirtualFileSystem at call time, so the microtask function carries no embedder-owned state
+  // and can be serialized into a startup snapshot. The address is registered as a V8 external
+  // reference in the Worker::Isolate constructor (via getStdioFlushMicrotaskCallbackRef).
+  static void flushMicrotaskCallback(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    auto& js = jsg::Lock::from(info.GetIsolate());
+    js.withinHandleScope([&] {
+      auto type = static_cast<VirtualFileSystem::Stdio>(info.Data().As<v8::Int32>()->Value());
+      auto opened = VirtualFileSystem::current(js).getStdio(js, type);
+      // Stdio fds are populated exclusively by getStdio() (regular fds start after Stdio::ERR),
+      // so the node is always a StdioFile.
+      auto& self = static_cast<StdioFile&>(*opened->node.get<kj::Rc<File>>().get());
+      self.microtaskScheduled = false;
+
+      if (!self.lineBuffer.empty()) {
+        // SECURITY: Move lineBuffer into a local before calling writeStdio so that
+        // re-entrant writes cannot free the backing store during the call.
+        auto toFlush = kj::mv(self.lineBuffer);
+        self.lineBuffer = kj::Vector<kj::byte>();
+        if (IoContext::hasCurrent()) {
+          writeStdio(js, self.type, toFlush.asPtr());
+        }
+      }
+    });
   }
 };
 
@@ -2029,6 +2033,10 @@ kj::Rc<Directory> getDevDirectory() {
   builder.add("full", getDevFull());
   builder.add("random", getDevRandom());
   return builder.finish();
+}
+
+intptr_t getStdioFlushMicrotaskCallbackRef() {
+  return reinterpret_cast<intptr_t>(&StdioFile::flushMicrotaskCallback);
 }
 
 kj::Rc<VirtualFileSystem::OpenedFile> VirtualFileSystemImpl::getStdio(
