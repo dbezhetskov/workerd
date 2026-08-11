@@ -693,13 +693,31 @@ void IsolateBase::prepareSnapshot(v8::Global<v8::Context> defaultContextHandle) 
   visitStructTypeHandles([](v8::Global<v8::Name>& h) { h.Reset(); },
       [](v8::Global<v8::DictionaryTemplate>& h) { h.Reset(); });
 
-  // 4. Reset module registry: per-entry module / source-object / mutable-exports / synthetic
-  // handles (incl. CommonJS evalFunc); the jsg::Data visitors also drop the paired
-  // TracedReference.
+  // 4. Pin every materialized module-registry handle into the snapshot and record
+  // (specifier, type, kind) -> index so the START_FROM_SNAPSHOT worker can overwrite its
+  // freshly re-registered entries with the baked instances — otherwise the baked main-module
+  // graph and runtime import()/require() would produce two module graphs (e.g. two
+  // Buffer.prototype identities). Reset every handle in the same pass: CreateBlob() requires
+  // all C++ globals cleared. Entries never instantiated in the zygote leaked no identity into
+  // the baked heap, so they are safe to recompile fresh at LOAD and are not pinned. The
+  // jsg::Data visitors also drop the paired TracedReference.
   KJ_REQUIRE(!usingNewModuleRegistry, "snapshot not yet supported with the new module registry");
   auto& moduleRegistry = KJ_ASSERT_NONNULL(getAlignedPointerFromEmbedderData<ModuleRegistry>(
       defaultContext, ContextPointerSlot::MODULE_REGISTRY));
-  moduleRegistry.visitHandlesForSnapshot([](v8::Global<v8::Data>& h) { h.Reset(); });
+  moduleRegistry.visitEntriesForSnapshot([&](ModuleRegistry::SnapshotHandleRef ref) {
+    bool pin = ref.kind != ModuleRegistry::SnapshotHandleKind::INTERNAL_ONLY &&
+        ref.status != v8::Module::kUninstantiated && !ref.handle.IsEmpty();
+    if (pin) {
+      uint32_t idx = creator->AddData(defaultContext, ref.handle.Get(ptr));
+      artifact.moduleRecords.add(SnapshotArtifact::ModuleRecord{
+        .specifier = ref.specifier.toString(false),
+        .moduleType = static_cast<uint8_t>(ref.type),
+        .handleKind = static_cast<uint8_t>(ref.kind),
+        .dataIndex = idx,
+      });
+    }
+    ref.handle.Reset();
+  });
 
   // 5. Reset the Global holding the default context, extracted from the script's module
   // context. The Local above keeps the context reachable for CreateBlob.
