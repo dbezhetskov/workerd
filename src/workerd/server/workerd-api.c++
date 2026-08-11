@@ -216,6 +216,11 @@ struct WorkerdApi::Impl final {
   kj::Own<CompatibilityFlags::Reader> features;
   capnp::List<config::Extension>::Reader extensions;
   kj::Own<JsgIsolateObserver> observer;
+  // Whether this isolate takes part in a startup snapshot (producing one or starting from one).
+  // Declared before jsgIsolate: Configuration reads it while jsgIsolate is being constructed,
+  // and the snapshotArtifact parameter itself is consumed by the jsgIsolate constructor in the
+  // same initializer, in unspecified argument order.
+  bool involvedInSnapshot;
   JsgWorkerdIsolate jsgIsolate;
   api::MemoryCacheProvider& memoryCacheProvider;
   const PythonConfig& pythonConfig;
@@ -230,7 +235,16 @@ struct WorkerdApi::Impl final {
             .fetchIterableTypeSupport = features.getFetchIterableTypeSupport(),
             .fetchIterableTypeSupportOverrideAdjustment =
                 features.getFetchIterableTypeSupportOverrideAdjustment(),
-            .fastApiEnabled = util::Autogate::isEnabled(util::AutogateKey::V8_FAST_API),
+            // Fast API stores a raw pointer to each method's static v8::CFunction as a
+            // Foreign<kCFunctionTag> heap object hanging off the FunctionTemplate. V8 15.0's
+            // startup serializer has no handling for these Foreigns, so a snapshot that bakes
+            // constructor templates would hit an unknown-external-reference fatal on every
+            // fast-api method. Disable fast API when preparing a snapshot, and when starting
+            // from one for consistency (the restored templates carry no fast path anyway).
+            // V8 15.1 makes CFunctions serializable (https://crrev.com/c/7828135); revert this
+            // once V8 is updated.
+            .fastApiEnabled = util::Autogate::isEnabled(util::AutogateKey::V8_FAST_API) &&
+                !impl.involvedInSnapshot,
           }) {}
     operator const CompatibilityFlags::Reader() const {
       return features;
@@ -256,6 +270,7 @@ struct WorkerdApi::Impl final {
       : features(capnp::clone(featuresParam)),
         extensions(extensionsParam),
         observer(kj::atomicAddRef(*observerParam)),
+        involvedInSnapshot(snapshotArtifact != kj::none),
         jsgIsolate(v8System,
             group,
             Configuration(*this),
