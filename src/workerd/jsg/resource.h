@@ -1311,6 +1311,9 @@ struct ResourceTypeBuilder {
         typeWrapper.template getTemplate<isContext>(isolate, static_cast<Type*>(nullptr)));
     // Propagate wildcard proxy to children. It's a data property, so it should be propagated, but v8 only handles normal data properties.
     auto& parentWrapper = static_cast<ResourceWrapper<TypeWrapper, Type>&>(typeWrapper);
+    // If the parent's template was restored from a startup snapshot, its registerMembers never
+    // ran and wildcardHandler is still unset; run it now so the propagation below sees it.
+    parentWrapper.ensureMembersRegistered(isolate);
     if (parentWrapper.wildcardHandler != kj::none) {
       auto& selfWrapper = static_cast<ResourceWrapper<TypeWrapper, Self>&>(typeWrapper);
       KJ_ASSERT(
@@ -2119,6 +2122,7 @@ class ResourceWrapper {
       } else {
         T::template registerMembers<decltype(builder), T>(builder);
       }
+      membersRegistered = true;
 
       KJ_IF_SOME(handler, wildcardHandler) {
         instance->SetHandler(handler);
@@ -2134,6 +2138,26 @@ class ResourceWrapper {
 
   kj::Maybe<v8::NamedPropertyHandlerConfiguration> wildcardHandler;
 
+  // Ensure T's registerMembers() has run in this isolate, so that side effects recorded on the
+  // wrapper itself — in particular `wildcardHandler` — are populated. Normally getTemplate()'s
+  // build branch takes care of this, but when the constructor template was restored from a
+  // startup snapshot the build branch never runs: the restored template itself still intercepts
+  // (V8 serializes the InterceptorInfo), but `wildcardHandler` stays kj::none, and
+  // registerInherit() would then silently fail to propagate the interceptor to subclass
+  // templates built fresh in the restored isolate (e.g. DurableObject inheriting Fetcher's
+  // JSG_WILDCARD_PROPERTY). In that case build a throwaway template to run registerMembers,
+  // then put the restored template back.
+  void ensureMembersRegistered(v8::Isolate* isolate) {
+    if (membersRegistered) return;
+    if (memoizedConstructor.IsEmpty()) {
+      getTemplate(isolate, static_cast<T*>(nullptr));
+      return;
+    }
+    v8::Global<v8::FunctionTemplate> restored = kj::mv(memoizedConstructor);
+    getTemplate(isolate, static_cast<T*>(nullptr));
+    memoizedConstructor = kj::mv(restored);
+  }
+
   // Enumerate this type's two constructor-template slots (empty or not) for startup-snapshot
   // handling. Slots are visited in a fixed compile-time order (parameter-pack order of the
   // TypeWrapper, memoizedConstructor then contextConstructor per type), so the
@@ -2148,6 +2172,9 @@ class ResourceWrapper {
   Configuration configuration;
   v8::Global<v8::FunctionTemplate> memoizedConstructor;
   v8::Global<v8::FunctionTemplate> contextConstructor;
+  // Whether registerMembers() has run in this isolate (getTemplate's build branch or
+  // ensureMembersRegistered()). False after a snapshot restore repopulates the slots directly.
+  bool membersRegistered = false;
 
   void setupJavascript(jsg::Lock& js) {
     JsSetup<TypeWrapper, T> setup(js, js.v8Context());
