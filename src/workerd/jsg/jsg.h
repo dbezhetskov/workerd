@@ -100,6 +100,18 @@ struct SnapshotArtifact: public kj::AtomicRefcounted {
   };
   kj::Vector<ModuleRecord> moduleRecords;
 
+  // Global-scope event listeners registered by zygote top-level code via addEventListener().
+  // The fresh ServiceWorkerGlobalScope built by newContext() at load discards the zygote's
+  // listener map, so each listener's identity object is pinned (identityIndex is a context-level
+  // SnapshotCreator::AddData index) and re-registered on load through the global's
+  // addEventListener, which re-derives the callback the same way the zygote registration did.
+  struct ListenerRecord {
+    kj::String type;
+    uint32_t identityIndex;
+    bool once;
+  };
+  kj::Vector<ListenerRecord> listenerRecords;
+
   ~SnapshotArtifact() noexcept(false) {
     // v8::SnapshotCreator::CreateBlob() allocates the data with `new[]` and hands over ownership.
     delete[] blob.data;
