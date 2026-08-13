@@ -442,7 +442,13 @@ class IsolateBase {
 
   // When preparing a snapshot: serialize the isolate with `defaultContextHandle` as the default
   // context and fill the SnapshotArtifact slot passed at isolate creation. No-op otherwise.
-  void prepareSnapshot(v8::Global<v8::Context> defaultContextHandle);
+  //
+  // `extraTemplateHandles` carries template handles drained from embedder-side caches that this
+  // class cannot enumerate itself (e.g. the Rust JSG Realm's resource-template cache, which jsg
+  // cannot depend on). Each one is pinned into the snapshot and disposed before CreateBlob;
+  // the caches are expected to rebuild the templates lazily on demand.
+  void prepareSnapshot(v8::Global<v8::Context> defaultContextHandle,
+      kj::Vector<v8::Global<v8::FunctionTemplate>> extraTemplateHandles = {});
 
   // Replays the entries collected by snapshotDeserializeInternalFields() once Context::New()
   // has returned: clones each artifact original and attaches the clone to its snapshot-restored
