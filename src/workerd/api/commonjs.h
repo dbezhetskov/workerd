@@ -11,6 +11,17 @@ class CommonJsModuleObject final: public jsg::Object {
  public:
   CommonJsModuleObject(jsg::Lock& js, kj::String path);
 
+  // Snapshot-clone constructor: `exports` starts empty and is recreated lazily on first
+  // access (the zygote's JS value travels through the snapshot heap, not the native side).
+  explicit CommonJsModuleObject(kj::String path): path(kj::mv(path)) {}
+
+  bool isSnapshotClonable() const override {
+    return true;
+  }
+  kj::Maybe<kj::Own<jsg::Wrappable>> snapshotClone() const override {
+    return ownAsWrappable(kj::refcounted<CommonJsModuleObject>(kj::str(path)));
+  }
+
   jsg::JsValue getExports(jsg::Lock& js) const;
   void setExports(jsg::Lock& js, jsg::JsValue value);
   kj::StringPtr getPath() const;
@@ -27,7 +38,8 @@ class CommonJsModuleObject final: public jsg::Object {
   void visitForMemoryInfo(jsg::MemoryTracker& tracker) const;
 
  private:
-  jsg::JsRef<jsg::JsValue> exports;
+  // none only right after a snapshot clone, until the lazy recreation in getExports().
+  mutable kj::Maybe<jsg::JsRef<jsg::JsValue>> exports;
   kj::String path;
 };
 
@@ -35,6 +47,35 @@ class CommonJsModuleContext final: public jsg::Object {
  public:
   CommonJsModuleContext(jsg::Lock& js, kj::Path path);
   CommonJsModuleContext(jsg::Lock& js, const jsg::Url& url);
+
+  // Snapshot-clone constructor.
+  CommonJsModuleContext(
+      jsg::Ref<CommonJsModuleObject> module, kj::OneOf<kj::Path, jsg::Url> pathOrSpecifier)
+      : module(kj::mv(module)),
+        pathOrSpecifier(kj::mv(pathOrSpecifier)) {}
+
+  bool isSnapshotClonable() const override {
+    return true;
+  }
+  kj::Maybe<kj::Own<jsg::Wrappable>> snapshotClone() const override {
+    auto clonedPath = ([&]() -> kj::OneOf<kj::Path, jsg::Url> {
+      KJ_SWITCH_ONEOF(pathOrSpecifier) {
+        KJ_CASE_ONEOF(path, kj::Path) {
+          return path.clone();
+        }
+        KJ_CASE_ONEOF(specifier, jsg::Url) {
+          return specifier.clone();
+        }
+      }
+      KJ_UNREACHABLE;
+    })();
+    // The clone gets its own fresh CommonJsModuleObject; `exports` on both starts empty and
+    // is recreated lazily (the zygote's JS values travel through the snapshot heap).
+    return ownAsWrappable(kj::refcounted<CommonJsModuleContext>(
+        jsg::Ref<CommonJsModuleObject>(
+            kj::refcounted<CommonJsModuleObject>(kj::str(module->getPath()))),
+        kj::mv(clonedPath)));
+  }
 
   jsg::JsValue require(jsg::Lock& js, kj::String specifier);
 
@@ -71,7 +112,8 @@ class CommonJsModuleContext final: public jsg::Object {
   // implementation. If it is a jsg::Url, then we are using the new module
   // registry implementation.
   kj::OneOf<kj::Path, jsg::Url> pathOrSpecifier;
-  jsg::JsRef<jsg::JsValue> exports;
+  // none only right after a snapshot clone, until the lazy recreation in getExports().
+  mutable kj::Maybe<jsg::JsRef<jsg::JsValue>> exports;
 };
 
 // Used with the original module registry implementation.
