@@ -10,6 +10,7 @@
 #include "setup.h"
 
 #include "libplatform/libplatform.h"
+#include "modules-new.h"
 
 #include <v8-cppgc.h>
 #include <v8-initialization.h>
@@ -737,23 +738,50 @@ void IsolateBase::prepareSnapshot(v8::Global<v8::Context> defaultContextHandle,
   // all C++ globals cleared. Entries never instantiated in the zygote leaked no identity into
   // the baked heap, so they are safe to recompile fresh at LOAD and are not pinned. The
   // jsg::Data visitors also drop the paired TracedReference.
-  KJ_REQUIRE(!usingNewModuleRegistry, "snapshot not yet supported with the new module registry");
-  auto& moduleRegistry = KJ_ASSERT_NONNULL(getAlignedPointerFromEmbedderData<ModuleRegistry>(
-      defaultContext, ContextPointerSlot::MODULE_REGISTRY));
-  moduleRegistry.visitEntriesForSnapshot([&](ModuleRegistry::SnapshotHandleRef ref) {
-    bool pin = ref.kind != ModuleRegistry::SnapshotHandleKind::INTERNAL_ONLY &&
-        ref.status != v8::Module::kUninstantiated && !ref.handle.IsEmpty();
-    if (pin) {
-      uint32_t idx = creator->AddData(defaultContext, ref.handle.Get(ptr));
+  // The two registries store unrelated types in the same MODULE_REGISTRY embedder slot, so
+  // the branch below must be taken before the slot is dereferenced.
+  if (usingNewModuleRegistry) {
+    // New module registry: the only V8-handle state is the per-context IsolateModuleRegistry's
+    // lookup cache of v8::Module handles; the visitor clears the cache afterwards, resetting
+    // all the Globals. `handleKind` is meaningless here (the new registry owns exactly one
+    // handle kind) and is recorded as 0; `moduleType` carries ResolveContext::Type rather than
+    // the old registry's Type — a worker is exclusively old-or-new, so the LOAD-side
+    // interpretation is unambiguous.
+    auto& js = Lock::from(ptr);
+    // The bound IsolateModuleRegistry is resolved through the current context.
+    v8::Context::Scope contextScope(defaultContext);
+    modules::ModuleRegistry::visitEntriesForSnapshot(
+        js, [&](modules::ModuleRegistry::SnapshotEntryRef ref) {
+      // kEvaluating is impossible here: a module only holds that status while its evaluation
+      // is on the stack, and prepareSnapshot runs with no JS frames active.
+      KJ_DASSERT(ref.status != v8::Module::kEvaluating);
+      if (ref.status == v8::Module::kUninstantiated) return;
+      uint32_t idx = creator->AddData(defaultContext, ref.handle);
       artifact.moduleRecords.add(SnapshotArtifact::ModuleRecord{
-        .specifier = ref.specifier.toString(false),
+        .specifier = kj::str(ref.specifier.getHref()),
         .moduleType = static_cast<uint8_t>(ref.type),
-        .handleKind = static_cast<uint8_t>(ref.kind),
+        .handleKind = 0,
         .dataIndex = idx,
       });
-    }
-    ref.handle.Reset();
-  });
+    });
+  } else {
+    auto& moduleRegistry = KJ_ASSERT_NONNULL(getAlignedPointerFromEmbedderData<ModuleRegistry>(
+        defaultContext, ContextPointerSlot::MODULE_REGISTRY));
+    moduleRegistry.visitEntriesForSnapshot([&](ModuleRegistry::SnapshotHandleRef ref) {
+      bool pin = ref.kind != ModuleRegistry::SnapshotHandleKind::INTERNAL_ONLY &&
+          ref.status != v8::Module::kUninstantiated && !ref.handle.IsEmpty();
+      if (pin) {
+        uint32_t idx = creator->AddData(defaultContext, ref.handle.Get(ptr));
+        artifact.moduleRecords.add(SnapshotArtifact::ModuleRecord{
+          .specifier = ref.specifier.toString(false),
+          .moduleType = static_cast<uint8_t>(ref.type),
+          .handleKind = static_cast<uint8_t>(ref.kind),
+          .dataIndex = idx,
+        });
+      }
+      ref.handle.Reset();
+    });
+  }
 
   // 5. Reset the Global holding the default context, extracted from the script's module
   // context. The Local above keeps the context reachable for CreateBlob.

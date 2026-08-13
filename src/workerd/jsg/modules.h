@@ -282,8 +282,9 @@ class ModuleRegistry {
   // Visit all v8::Global handles owned by materialized module entries, tagged with their
   // identity (specifier/type/kind). Must be called (and every handle reset) before
   // SnapshotCreator::CreateBlob(), otherwise V8 reports unserialized global handles. The caller
-  // may AddData-pin a handle before resetting it. Only meaningful for the old module registry;
-  // the new one (modules-new) holds no v8::Global handles directly.
+  // may AddData-pin a handle before resetting it. Old module registry only; the new one keeps
+  // its v8::Module Globals in the per-context lookup cache and has its own snapshot pair
+  // (jsg::modules::ModuleRegistry::visitEntriesForSnapshot/restoreSnapshotEntry).
   virtual void visitEntriesForSnapshot(kj::FunctionParam<void(SnapshotHandleRef)> fn) = 0;
 
   // At START_FROM_SNAPSHOT, overwrite the identified handle of the matching (re-registered and

@@ -5635,11 +5635,11 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
 kj::Own<jsg::SnapshotArtifact> Server::makeSnapshot(kj::StringPtr name,
     WorkerDef& def,
     capnp::List<config::Extension>::Reader extensions,
-    ErrorReporter& errorReporter) {
+    ErrorReporter& errorReporter,
+    kj::Maybe<kj::Arc<jsg::modules::ModuleRegistry>> newModuleRegistry) {
   // Build a throwaway zygote Worker in PREPARE_SNAPSHOT mode just to extract a V8 startup
   // snapshot; the caller then builds the real Worker in START_FROM_SNAPSHOT mode using it.
   KJ_REQUIRE(!def.featureFlags.getPythonWorkers(), "snapshot PoC: no Python workers");
-  KJ_REQUIRE(!def.featureFlags.getNewModuleRegistry(), "snapshot PoC: no new module registry");
   KJ_REQUIRE(!def.source.variant.is<WorkerSource::ScriptSource>(), "snapshot PoC: ESM only");
 
   auto isolateGroup = v8::IsolateGroup::GetDefault();
@@ -5661,10 +5661,14 @@ kj::Own<jsg::SnapshotArtifact> Server::makeSnapshot(kj::StringPtr name,
 
   auto zygoteArtifactBundler = workerd::api::pyodide::ArtifactBundler::makeDisabledBundler();
 
+  // The zygote shares the real worker's module registry: the registry holds no V8 state
+  // (all V8 handles live in the per-context IsolateModuleRegistry), and sharing keeps the
+  // zygote's compile cache and fallback-bundle storage warm for the real worker. It also keeps
+  // the two phases' registries consistent, which the LOAD-time snapshot replay relies on to
+  // re-resolve recorded specifiers to the same Module definitions.
   auto zygoteScript = zygoteIsolate->newScript(name, def.source, IsolateObserver::StartType::COLD,
       SpanParent(nullptr), kj::mv(zygoteWorkerFs), false, errorReporter,
-      kj::mv(zygoteArtifactBundler),
-      /*newModuleRegistry=*/kj::none);
+      kj::mv(zygoteArtifactBundler), kj::mv(newModuleRegistry));
 
   auto zygoteCompileBindings =
       [&](jsg::Lock& lock, const Worker::Api& api, v8::Local<v8::Object> target,
@@ -5754,7 +5758,8 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
 
   kj::Maybe<jsg::SnapshotConfig> snapshotConfig;
   if (util::Autogate::isEnabled(util::AutogateKey::STARTUP_SNAPSHOT)) {
-    auto snapshotArtifact = makeSnapshot(name, def, extensions, errorReporter);
+    auto snapshotArtifact = makeSnapshot(name, def, extensions, errorReporter,
+        newModuleRegistry.map([](kj::Arc<jsg::modules::ModuleRegistry>& r) { return r.addRef(); }));
     snapshotConfig =
         jsg::SnapshotConfig(jsg::ReadonlySharedSnapshot{.artifact = snapshotArtifact->addRef()});
   }

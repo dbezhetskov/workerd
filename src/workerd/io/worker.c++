@@ -1165,6 +1165,13 @@ Worker::Isolate::Isolate(kj::Own<Api> apiParam,
         lock->v8Isolate, reinterpret_cast<intptr_t>(jsg::getLegacyRequireCallback()));
     jsg::isolateRegisterExternalReference(
         lock->v8Isolate, reinterpret_cast<intptr_t>(jsg::modules::getRequireCallback()));
+    // New-registry analogs: CreateSyntheticModule embeds the evaluation-steps address in
+    // every synthetic module, and import.meta.resolve is a static trampoline whose data is
+    // a plain JS string (the referrer href).
+    jsg::isolateRegisterExternalReference(
+        lock->v8Isolate, jsg::modules::getSyntheticModuleEvalRef());
+    jsg::isolateRegisterExternalReference(
+        lock->v8Isolate, reinterpret_cast<intptr_t>(jsg::modules::getImportMetaResolveCallback()));
     jsg::isolateRegisterExternalReference(
         lock->v8Isolate, reinterpret_cast<intptr_t>(&api::ByteLengthQueuingStrategy::sizeCallback));
     jsg::isolateRegisterExternalReference(
@@ -1670,6 +1677,44 @@ Worker::Script::Script(kj::Own<const Isolate> isolateParam,
                             "the baked graph is broken for it",
                             rec.specifier);
                       }
+                    }
+                  }
+                } else if (lock.isStartingFromSnapshot()) {
+                  // New module registry: nothing compiles at Script-construction time (modules
+                  // materialize lazily on first import), but the baked lookup-cache entries must
+                  // be re-keyed into the fresh per-context IsolateModuleRegistry — otherwise the
+                  // baked main-module graph and runtime import()/require() yield two module
+                  // graphs (e.g. two Buffer.prototype identities). The Module definitions are
+                  // re-resolved from the shared registry; the baked v8::Module stands in for the
+                  // getDescriptor() compile.
+                  auto& isolateBase = jsg::IsolateBase::from(lock.v8Isolate);
+                  const auto& artifact = isolateBase.readonlySnapshotArtifact();
+                  const bool hasFallback = isolateBase.tryGetModuleFallback() != kj::none;
+                  // The bound IsolateModuleRegistry is resolved through the current context.
+                  v8::Context::Scope contextScope(context);
+                  for (auto& rec: artifact.moduleRecords) {
+                    v8::Local<v8::Data> data;
+                    KJ_REQUIRE(
+                        context->GetDataFromSnapshotOnce<v8::Data>(rec.dataIndex).ToLocal(&data),
+                        "START_FROM_SNAPSHOT: module snapshot data missing", rec.specifier,
+                        rec.dataIndex);
+                    KJ_REQUIRE(data->IsModule(),
+                        "START_FROM_SNAPSHOT: pinned module data is not a v8::Module",
+                        rec.specifier);
+                    bool found =
+                        jsg::modules::ModuleRegistry::restoreSnapshotEntry(js, rec.specifier,
+                            static_cast<jsg::modules::ResolveContext::Type>(rec.moduleType),
+                            data.As<v8::Module>());
+                    if (!found) {
+                      // Only fallback-service modules resolve lazily and can legitimately be
+                      // absent from the rebuilt shared registry.
+                      KJ_REQUIRE(hasFallback,
+                          "START_FROM_SNAPSHOT: pinned module has no registry entry",
+                          rec.specifier);
+                      KJ_LOG(WARNING,
+                          "module fallback entry not restored from snapshot; identity with "
+                          "the baked graph is broken for it",
+                          rec.specifier);
                     }
                   }
                 }
