@@ -608,7 +608,8 @@ void IsolateBase::applyPendingInternalFieldRestores(PendingInternalFieldRestores
   }
 }
 
-void IsolateBase::prepareSnapshot(v8::Global<v8::Context> defaultContextHandle) {
+void IsolateBase::prepareSnapshot(v8::Global<v8::Context> defaultContextHandle,
+    kj::Vector<v8::Global<v8::FunctionTemplate>> extraTemplateHandles) {
   KJ_REQUIRE(mode == IsolateMode::PREPARE_SNAPSHOT);
   // PREPARE_SNAPSHOT mode implies the isolate was constructed with a PRODUCE-mode artifact,
   // so the slot is guaranteed to be present.
@@ -675,6 +676,16 @@ void IsolateBase::prepareSnapshot(v8::Global<v8::Context> defaultContextHandle) 
     artifact.constructorTemplateIndices.add(creator->AddData(h.Get(ptr)));
     h.Reset();
   });
+
+  // 2b. Pin and dispose template handles drained from embedder-side caches (e.g. Rust JSG
+  // resource templates such as node-internal:dns), which are invisible to the C++ template
+  // slots above. Ownership was transferred to us by the caller; the caches rebuild templates
+  // lazily on demand and a START_FROM_SNAPSHOT isolate starts with them empty.
+  for (auto& h: extraTemplateHandles) {
+    if (h.IsEmpty()) continue;
+    creator->AddData(defaultContext, h.Get(ptr));
+    h.Reset();
+  }
 
   // 3. Reset struct-type handles: dictionary template + field-name handles per JSG_STRUCT.
   visitStructTypeHandles([](v8::Global<v8::Name>& h) { h.Reset(); },

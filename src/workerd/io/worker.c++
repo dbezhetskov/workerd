@@ -2414,7 +2414,27 @@ Worker::Worker(kj::Own<const Script> scriptParam,
           const_cast<Script&>(*script).impl->moduleContext = kj::none;
           impl->context = kj::none;
         });
-        isolateBase.prepareSnapshot(jsContext->extractContextGlobalForSnapshot());
+
+        // Rust JSG resource templates (e.g. node-internal:dns) are cached as v8::Globals
+        // inside the Rust Realm, invisible to the C++ template slots and reset passes — each
+        // one would trip CreateBlob's CheckGlobalAndEternalHandles. Drain them here (ownership
+        // of each persistent handle transfers to this vector) and hand them to
+        // prepareSnapshot() to pin and dispose like any other isolate handle. Templates are
+        // recreated lazily on demand and a START_FROM_SNAPSHOT isolate starts with an empty
+        // cache.
+        kj::Vector<v8::Global<v8::FunctionTemplate>> rustTemplateHandles;
+        {
+          auto* realm = ::workerd::rust::jsg::realm_from_isolate(lock.v8Isolate);
+          for (size_t word: ::workerd::rust::jsg::realm_take_resource_templates(*realm)) {
+            v8::Global<v8::FunctionTemplate> handle;
+            static_assert(sizeof(handle) == sizeof(word), "v8::Global must be one pointer word");
+            memcpy(static_cast<void*>(&handle), &word, sizeof(word));
+            rustTemplateHandles.add(kj::mv(handle));
+          }
+        }
+
+        isolateBase.prepareSnapshot(
+            jsContext->extractContextGlobalForSnapshot(), kj::mv(rustTemplateHandles));
         KJ_DASSERT(jsContext->getHandle(lock).IsEmpty(),
             "zygote context handle must be consumed by prepareSnapshot");
       }
