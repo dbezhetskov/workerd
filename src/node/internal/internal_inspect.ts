@@ -229,11 +229,20 @@ export interface InspectOptionsStylized extends InspectOptions {
   stylize(text: string, styleType: Style): string;
 }
 
-const builtInObjects = new Set(
-  Object.getOwnPropertyNames(globalThis).filter(
-    (e) => /^[A-Z][a-zA-Z0-9]+$/.exec(e) !== null
-  )
-);
+// Computed lazily: in a snapshot zygote (serializer-enabled isolate) V8 skips
+// InitializeExperimentalGlobal(), so flag-staged globals (Float16Array,
+// DisposableStack, ...; see V8System init in workerd/jsg/setup.c++) are absent
+// from globalThis at module-eval time. Deferring the scan to first use makes it
+// run in the restored worker, where they exist.
+let builtInObjectsCache: Set<string> | undefined;
+function getBuiltInObjects(): Set<string> {
+  builtInObjectsCache ??= new Set(
+    Object.getOwnPropertyNames(globalThis).filter(
+      (e) => /^[A-Z][a-zA-Z0-9]+$/.exec(e) !== null
+    )
+  );
+  return builtInObjectsCache;
+}
 
 // https://tc39.es/ecma262/#sec-IsHTMLDDA-internal-slot
 const isUndetectableObject = (v: unknown): boolean =>
@@ -889,7 +898,7 @@ function getConstructorName(
     ) {
       if (
         protoProps !== undefined &&
-        (firstProto !== obj || !builtInObjects.has(descriptor.value.name))
+        (firstProto !== obj || !getBuiltInObjects().has(descriptor.value.name))
       ) {
         addPrototypeProperties(
           ctx,
@@ -961,7 +970,7 @@ function addPrototypeProperties(
       if (
         descriptor !== undefined &&
         typeof descriptor.value === 'function' &&
-        builtInObjects.has(descriptor.value.name)
+        getBuiltInObjects().has(descriptor.value.name)
       ) {
         return;
       }
@@ -2700,7 +2709,7 @@ function hasBuiltInToString(value: object): boolean {
   return (
     descriptor !== undefined &&
     typeof descriptor.value === 'function' &&
-    builtInObjects.has(descriptor.value.name)
+    getBuiltInObjects().has(descriptor.value.name)
   );
 }
 
@@ -3039,7 +3048,7 @@ function isBuiltinPrototype(proto: unknown) {
   return (
     descriptor !== undefined &&
     typeof descriptor.value === 'function' &&
-    builtInObjects.has(descriptor.value.name)
+    getBuiltInObjects().has(descriptor.value.name)
   );
 }
 

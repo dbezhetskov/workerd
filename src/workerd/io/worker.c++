@@ -1478,6 +1478,21 @@ Worker::Script::Script(kj::Own<const Isolate> isolateParam,
         context = mContext.getHandle(lock);
         recordedLock.setupContext(context);
 
+        if (lock.isPreparingSnapshot()) {
+          // V8's Genesis skips InstallSpecialObjects() for serializer-enabled isolates ("don't
+          // install extensions into the snapshot"), so the zygote context lacks
+          // Error.stackTraceLimit and new Error() captures no stack at all — zygote-created
+          // errors would report the *caller's* location after the snapshot round-trip. Install
+          // the default limit so zygote errors capture their stack; it is deleted again before
+          // CreateBlob because the loading context re-runs InstallSpecialObjects, which must
+          // not find the property already present.
+          auto errorObj = jsg::check(
+              context->Global()->Get(context, jsg::v8StrIntern(lock.v8Isolate, "Error"_kj)))
+                              .As<v8::Object>();
+          jsg::check(errorObj->Set(context, jsg::v8StrIntern(lock.v8Isolate, "stackTraceLimit"_kj),
+              v8::Number::New(lock.v8Isolate, 10)));
+        }
+
         if (util::Autogate::isEnabled(util::AutogateKey::PER_ISOLATE_JAVASCRIPT_BOOTSTRAP)) {
           // Run per-isolate bootstrap scripts before any user code.
           JSG_WITHIN_CONTEXT_SCOPE(lock, context, [&](jsg::Lock& js) {
@@ -2104,6 +2119,13 @@ void Worker::setupContextInternalScripts(jsg::Lock& lock, v8::Local<v8::Context>
 // =======================================================================================
 
 namespace {
+// Flag-staged JS features (--js-float16array, --js-explicit-resource-management; see
+// V8System::init in jsg/setup.c++) are never installed on serializer-enabled isolates, so the
+// zygote global lacks these constructors and top-level code referencing them throws a plain
+// ReferenceError. The snapshot-mode startup gate matches them by name.
+constexpr kj::StringPtr stagedGlobals[] = {
+  "Float16Array"_kj, "DisposableStack"_kj, "AsyncDisposableStack"_kj, "SuppressedError"_kj};
+
 kj::Maybe<jsg::JsObject> tryResolveMainModule(jsg::Lock& js,
     const kj::Path& mainModule,
     jsg::JsContext<api::ServiceWorkerGlobalScope>& jsContext,
@@ -2429,6 +2451,20 @@ Worker::Worker(kj::Own<const Script> scriptParam,
             // in the outer try/catch.
           }
         } catch (const jsg::JsExceptionThrown&) {
+          if (lock.isPreparingSnapshot() && catcher.HasCaught() && !catcher.Message().IsEmpty()) {
+            // Surface top-level use of a flag-staged global (absent in the zygote; see
+            // stagedGlobals above) as a named snapshot limitation instead of a generic user
+            // startup error.
+            auto msg = js.toString(catcher.Message()->Get());
+            for (auto& name: stagedGlobals) {
+              if (msg.endsWith(kj::str("ReferenceError: ", name, " is not defined"))) {
+                KJ_FAIL_REQUIRE(
+                    "snapshot PoC: top-level use of flag-staged global is not supported in "
+                    "zygote execution",
+                    name);
+              }
+            }
+          }
           reportStartupError(script->id, lock, script->isolate->impl->inspector,
               script->isolate->getLimitEnforcer(), kj::mv(limitErrorOrTime), catcher, errorReporter,
               impl->permanentException, currentSpan, script->getDynamicEnvBuilder() != kj::none);
@@ -2450,6 +2486,18 @@ Worker::Worker(kj::Own<const Script> scriptParam,
           const_cast<Script&>(*script).impl->moduleContext = kj::none;
           impl->context = kj::none;
         });
+
+        {
+          // Remove the Error.stackTraceLimit installed for zygote execution (see the
+          // isPreparingSnapshot() block in the Script constructor): the loading context re-runs
+          // InstallSpecialObjects(), which adds the property and must not find it baked in.
+          auto context = jsContext->getHandle(lock);
+          auto errorObj = jsg::check(
+              context->Global()->Get(context, jsg::v8StrIntern(lock.v8Isolate, "Error"_kj)))
+                              .As<v8::Object>();
+          KJ_REQUIRE(jsg::check(
+              errorObj->Delete(context, jsg::v8StrIntern(lock.v8Isolate, "stackTraceLimit"_kj))));
+        }
 
         // Rust JSG resource templates (e.g. node-internal:dns) are cached as v8::Globals
         // inside the Rust Realm, invisible to the C++ template slots and reset passes — each
