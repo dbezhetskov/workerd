@@ -2498,6 +2498,14 @@ Worker::Worker(kj::Own<const Script> scriptParam,
               errorObj->Delete(context, jsg::v8StrIntern(lock.v8Isolate, "stackTraceLimit"_kj))));
         }
 
+        // The per-isolate bootstrap (if it ran on this context) heap-allocated a
+        // BootstrapState holding strong v8::Globals (require cache, primordials,
+        // context-extension template). It is normally deleted via disposeContext(), which
+        // this path bypasses, and prepareSnapshot()'s pin/reset passes don't know about
+        // it — each surviving handle would trip CreateBlob's CheckGlobalAndEternalHandles.
+        // Drop it now; the loading context re-runs the bootstrap and installs fresh state.
+        cleanupPerIsolateBootstrap(lock, jsContext->getHandle(lock));
+
         // Rust JSG resource templates (e.g. node-internal:dns) are cached as v8::Globals
         // inside the Rust Realm, invisible to the C++ template slots and reset passes — each
         // one would trip CreateBlob's CheckGlobalAndEternalHandles. Drain them here (ownership

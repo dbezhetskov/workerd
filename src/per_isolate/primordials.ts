@@ -368,8 +368,11 @@ const DataViewPrototypeGetByteLength = getProtoGetter<
 // lookups can't be confused via Object.prototype pollution. DataView is not
 // in this map (the getter returns undefined for it) — detect it separately
 // and use the DataView capture above.
-// Float16Array is enabled unconditionally via --js-float16array (jsg
-// setup.c++), so a plain capture is safe.
+// Float16Array needs a typeof guard: --js-float16array is set unconditionally
+// (jsg setup.c++), but staged features are never installed on serializer-enabled
+// isolates, so the global is absent in a snapshot zygote. There the capture
+// yields undefined; the bootstrap re-runs on the restored context (where V8
+// does install it), so real workers always capture the live constructor.
 const TypedArrayCtorByName = ObjectFreeze(
   ObjectSetPrototypeOf(
     {
@@ -380,7 +383,8 @@ const TypedArrayCtorByName = ObjectFreeze(
       Uint16Array,
       Int32Array,
       Uint32Array,
-      Float16Array,
+      Float16Array:
+        typeof Float16Array === 'undefined' ? undefined : Float16Array,
       Float32Array,
       Float64Array,
       BigInt64Array,
