@@ -645,10 +645,14 @@ void IsolateBase::applyPendingInternalFieldRestores(PendingInternalFieldRestores
 }
 
 void IsolateBase::prepareSnapshot(v8::Global<v8::Context> defaultContextHandle,
-    kj::Vector<v8::Global<v8::FunctionTemplate>> extraTemplateHandles) {
+    kj::Vector<v8::Global<v8::FunctionTemplate>> extraTemplateHandles,
+    kj::Vector<SnapshotArtifact::ListenerRecord> listenerRecords) {
   KJ_REQUIRE(isPreparingSnapshot());
   auto& artifact = mutableSnapshotArtifact();
   auto& creator = KJ_ASSERT_NONNULL(snapshotCreator);
+
+  // The identity objects referenced by these records were already AddData-pinned by the caller.
+  artifact.listenerRecords = kj::mv(listenerRecords);
 
   // Full GC before any pinning. Top-level evaluation leaves dead-but-uncollected garbage
   // reachable to the pinning passes below — most importantly settled promise reactions
