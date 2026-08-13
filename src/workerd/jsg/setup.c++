@@ -615,13 +615,34 @@ void IsolateBase::prepareSnapshot(v8::Global<v8::Context> defaultContextHandle) 
   auto& artifact = KJ_REQUIRE_NONNULL(snapshotArtifact);
   auto& creator = KJ_ASSERT_NONNULL(snapshotCreator);
 
+  // Full GC before any pinning. Top-level evaluation leaves dead-but-uncollected garbage
+  // reachable to the pinning passes below — most importantly settled promise reactions
+  // whose C++ continuation functions (jsg::promiseContinuation templates with opaque
+  // native data) cannot be serialized, and dead wrappers still on the HeapTracer list.
+  // Collecting now keeps that garbage out of the snapshot; CreateBlob's own GC runs too
+  // late (after the pins below have made the garbage reachable).
+  // LowMemoryNotification() is a synchronous full GC that works in production builds.
+  ptr->LowMemoryNotification();
+
+  auto defaultContext = defaultContextHandle.Get(ptr);
+
+  // Pin and reset every live resource's *member* handles (jsg::Data / V8Ref fields such as
+  // EventTarget listeners or ServiceWorkerGlobalScope's lazy process/Buffer caches). The JS
+  // values stay reachable in the snapshot via AddData; the restored worker's resources start
+  // with empty members and lazily re-resolve where applicable. Must run before
+  // resetLiveWrappableInstances() detaches the wrappers below.
+  {
+    GcVisitor::SnapshotPin pin = [&](v8::Local<v8::Data> data) {
+      creator->AddData(defaultContext, data);
+    };
+    heapTracer.pinAndResetMemberHandlesForSnapshot(pin);
+  }
+
   // Detach the strongWrapper / traced wrapper of every live Wrappable.
   // The returned keepalives are held in this scope so they
   // outlive CreateBlob() below, which dereferences the Wrappable* stored in internal
   // fields while serializing.
   auto snapshotKeepalives = heapTracer.resetLiveWrappableInstances();
-
-  auto defaultContext = defaultContextHandle.Get(ptr);
 
   // Wrapper objects carry aligned internal-field pointers: WORKERD_WRAPPABLE_TAG +
   // Wrappable*. The serialize callback replaces each Wrappable* with a uint32 index

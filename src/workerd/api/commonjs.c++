@@ -9,13 +9,15 @@ namespace workerd::api {
 
 CommonJsModuleContext::CommonJsModuleContext(jsg::Lock& js, kj::Path path)
     : module(js.alloc<CommonJsModuleObject>(js, path.toString(true))),
-      pathOrSpecifier(kj::mv(path)),
-      exports(js, module->getExports(js)) {}
+      pathOrSpecifier(kj::mv(path)) {
+  exports = jsg::JsRef(js, module->getExports(js));
+}
 
 CommonJsModuleContext::CommonJsModuleContext(jsg::Lock& js, const jsg::Url& specifier)
     : module(js.alloc<CommonJsModuleObject>(js, kj::str(specifier.getHref()))),
-      pathOrSpecifier(specifier.clone()),
-      exports(js, module->getExports(js)) {}
+      pathOrSpecifier(specifier.clone()) {
+  exports = jsg::JsRef(js, module->getExports(js));
+}
 
 jsg::JsValue CommonJsModuleContext::require(jsg::Lock& js, kj::String specifier) {
   if (isNodeJsCompatEnabled(js)) {
@@ -128,18 +130,32 @@ jsg::Ref<CommonJsModuleObject> CommonJsModuleContext::getModule(jsg::Lock& js) {
 }
 
 jsg::JsValue CommonJsModuleContext::getExports(jsg::Lock& js) const {
-  return exports.getHandle(js);
+  KJ_IF_SOME(e, exports) {
+    return e.getHandle(js);
+  }
+  // Empty only after a snapshot clone: re-derive from the module object like the normal
+  // constructor does.
+  auto value = module->getExports(js);
+  exports = jsg::JsRef(js, value);
+  return value;
 }
 void CommonJsModuleContext::setExports(jsg::Lock& js, jsg::JsValue value) {
   exports = jsg::JsRef(js, value);
 }
 
-CommonJsModuleObject::CommonJsModuleObject(jsg::Lock& js, kj::String path)
-    : exports(js, js.obj()),
-      path(kj::mv(path)) {}
+CommonJsModuleObject::CommonJsModuleObject(jsg::Lock& js, kj::String path): path(kj::mv(path)) {
+  jsg::JsValue value = js.obj();
+  exports = jsg::JsRef(js, value);
+}
 
 jsg::JsValue CommonJsModuleObject::getExports(jsg::Lock& js) const {
-  return exports.getHandle(js);
+  KJ_IF_SOME(e, exports) {
+    return e.getHandle(js);
+  }
+  // Empty only after a snapshot clone: recreate lazily like in a fresh module.
+  jsg::JsValue value = js.obj();
+  exports = jsg::JsRef(js, value);
+  return value;
 }
 void CommonJsModuleObject::setExports(jsg::Lock& js, jsg::JsValue value) {
   exports = jsg::JsRef(js, value);

@@ -114,6 +114,23 @@ class ErrorEvent: public Event {
   static jsg::Ref<ErrorEvent> constructor(
       jsg::Lock& js, kj::String type, jsg::Optional<ErrorEventInit> init);
 
+  // The plain C++ state is copied; the `error` JS value cannot travel through the native side
+  // (it is pinned into the snapshot heap separately), so the clone starts without it.
+  bool isSnapshotClonable() const override {
+    return true;
+  }
+  kj::Maybe<kj::Own<jsg::Wrappable>> snapshotClone() const override {
+    return ownAsWrappable(
+        kj::refcounted<ErrorEvent>(kj::str(const_cast<ErrorEvent*>(this)->getType()),
+            ErrorEventInit{
+              .message = init.message.map([](const kj::String& s) { return kj::str(s); }),
+              .filename = init.filename.map([](const kj::String& s) { return kj::str(s); }),
+              .lineno = init.lineno,
+              .colno = init.colno,
+              .error = kj::none,
+            }));
+  }
+
   kj::StringPtr getFilename();
   kj::StringPtr getMessage();
   int getLineno();

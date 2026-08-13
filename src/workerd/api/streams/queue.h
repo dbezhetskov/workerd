@@ -547,6 +547,24 @@ class ConsumerImpl final: public kj::PtrTarget {
     // we access the resolver, then v8 could determine that the resolver or buffered
     // entries are no longer reachable via tracing and free them before we can
     // actually try to access the held resolver.
+    //
+    // In snapshot-reset mode, however, the buffered entries' strong Globals MUST be pinned
+    // and dropped or they trip CreateBlob's CheckGlobalAndEternalHandles. The hazard
+    // described above cannot occur there: the zygote is discarded right after the blob is
+    // produced and no code runs on it again. Pending readRequests are deliberately NOT
+    // pinned: their resolver's promise carries C++ promise-continuation functions
+    // (jsg::promiseContinuation templates with opaque native data) that cannot be
+    // serialized — a top-level read pending at snapshot time simply never settles in
+    // workers started from the snapshot.
+    if (visitor.isSnapshotReset()) {
+      KJ_IF_SOME(ready, state.tryGetActiveUnsafe()) {
+        for (auto& item: ready.buffer) {
+          KJ_IF_SOME(entry, item.template tryGet<QueueEntry>()) {
+            entry.entry->visitForGc(visitor);
+          }
+        }
+      }
+    }
   }
 
   inline kj::StringPtr jsgGetMemoryName() const;
@@ -1003,10 +1021,10 @@ class ByteQueue final {
     }
 
    private:
-    // Intentionally not visited by visitForGc: Entry is not reachable from JS;
+    // Intentionally not visited during normal GC: Entry is not reachable from JS;
     // it is owned via kj::Rc<Entry> (C++ refcount), so the BufferSource cannot be
     // part of a JS→C++→JS reference cycle and a strong v8::Global suffices
-    // to keep it alive. See queue.c++:562 for the empty visitForGc body.
+    // to keep it alive. visitForGc (queue.c++) touches it only in snapshot-reset mode.
     jsg::BufferSource store;  // NOLINT(jsg-visit-for-gc)
   };
 

@@ -74,6 +74,13 @@ kj::Vector<kj::Own<Wrappable>> HeapTracer::resetLiveWrappableInstances() {
   return keepalives;
 }
 
+void HeapTracer::pinAndResetMemberHandlesForSnapshot(kj::Function<void(v8::Local<v8::Data>)>& pin) {
+  for (auto& w: wrappers) {
+    GcVisitor visitor(w, pin);
+    w.jsgVisitForGc(visitor);
+  }
+}
+
 using JSGWrappable = workerd::jsg::Wrappable;
 
 // V8's GC integrates with cppgc, aka "oilpan", a garbage collector for C++ objects. We want to
@@ -452,6 +459,13 @@ void Wrappable::jsgVisitForGc(GcVisitor& visitor) {
 }
 
 void Wrappable::visitRef(GcVisitor& visitor, kj::Maybe<Wrappable&>& refParent, bool& refStrong) {
+  if (visitor.snapshotPin != kj::none) {
+    // Snapshot-reset mode: child Wrappables with a JS wrapper are pinned/reset via their own
+    // entry in the HeapTracer wrappers list, so there is nothing to do for the Ref itself and
+    // the ref-strength bookkeeping below must not run.
+    return;
+  }
+
   KJ_IF_SOME(p, refParent) {
     KJ_ASSERT(&p == &visitor.parent);
   } else {
@@ -505,6 +519,22 @@ void Wrappable::visitRef(GcVisitor& visitor, kj::Maybe<Wrappable&>& refParent, b
 
 void GcVisitor::visit(Data& value) {
   if (!value.handle.IsEmpty()) {
+    KJ_IF_SOME(pin, snapshotPin) {
+      // Snapshot-reset mode: pin the JS value into the snapshot, then drop the C++ handles so
+      // they don't trip CreateBlob's CheckGlobalAndEternalHandles. The zygote is discarded
+      // right after the blob is produced, so the emptied member is never observed.
+      {
+        v8::HandleScope scope(parent.isolate);
+        pin(value.handle.Get(parent.isolate));
+      }
+      value.handle.Reset();
+      KJ_IF_SOME(t, value.tracedHandle) {
+        t.Reset();
+      }
+      value.tracedHandle = kj::none;
+      return;
+    }
+
     // Make ref strength match the parent.
     if (parent.strongRefcount > 0 && parent.wrapper == kj::none) {
       // This is directly reachable by a strong ref, so mark the handle strong.
@@ -535,8 +565,28 @@ void GcVisitor::visit(Data& value) {
   }
 }
 
+void GcVisitor::dropForSnapshot(Data& value) {
+  if (snapshotPin == kj::none) return;
+  value.handle.Reset();
+  KJ_IF_SOME(t, value.tracedHandle) {
+    t.Reset();
+  }
+  value.tracedHandle = kj::none;
+}
+
 void GcVisitor::visit(v8::Global<v8::Value>& strong, v8::TracedReference<v8::Data>& traced) {
   if (strong.IsEmpty()) {
+    return;
+  }
+
+  KJ_IF_SOME(pin, snapshotPin) {
+    // Snapshot-reset mode; mirrors visit(Data&).
+    {
+      v8::HandleScope scope(parent.isolate);
+      pin(strong.Get(parent.isolate));
+    }
+    strong.Reset();
+    traced.Reset();
     return;
   }
 

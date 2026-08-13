@@ -583,7 +583,14 @@ kj::Rc<ByteQueue::Entry> ByteQueue::Entry::clone(jsg::Lock& js) {
   return addRefToThis();
 }
 
-void ByteQueue::Entry::visitForGc(jsg::GcVisitor& visitor) {}
+void ByteQueue::Entry::visitForGc(jsg::GcVisitor& visitor) {
+  // `store` is deliberately not visited during normal GC (see the comment on the member),
+  // but in snapshot-reset mode its strong Global must be pinned and dropped or it trips
+  // CreateBlob's CheckGlobalAndEternalHandles.
+  if (visitor.isSnapshotReset()) {
+    visitor.visit(store);
+  }
+}
 
 #pragma endregion ByteQueue::Entry
 
