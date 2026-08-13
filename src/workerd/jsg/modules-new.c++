@@ -194,8 +194,12 @@ class EsModule final: public Module {
     // either case, we try generating it and store it. Multiple threads can end up
     // lining up here to acquire the lock and generate the cache. We'll test to see
     // if the cached data is still empty once the lock is acquired, and if it is
-    // not, we'll skip generation.
-    if (options == v8::ScriptCompiler::CompileOptions::kNoCompileOptions) {
+    // not, we'll skip generation. Skipped in a PREPARE_SNAPSHOT isolate: V8 fatals with
+    // "Cannot create code cache while creating a snapshot" — modules the zygote compiled
+    // are baked into the snapshot anyway, so the cache would only ever serve workers that
+    // resolve a module the zygote never touched.
+    if (options == v8::ScriptCompiler::CompileOptions::kNoCompileOptions &&
+        !js.isPreparingSnapshot()) {
       auto lock = cachedData.lockExclusive();
       if (*lock == kj::none) {
         if (auto ptr = v8::ScriptCompiler::CreateCodeCache(module->GetUnboundModuleScript())) {
@@ -279,6 +283,10 @@ class SyntheticModule final: public Module {
     return v8::Module::CreateSyntheticModule(js.v8Isolate, js.str(id().getHref()),
         v8::MemorySpan<const v8::Local<v8::String>>(exports.data(), exports.size()),
         evaluationSteps);
+  }
+
+  static intptr_t getEvalStepsRef() {
+    return reinterpret_cast<intptr_t>(&evaluationSteps);
   }
 
  private:
@@ -760,6 +768,58 @@ class IsolateModuleRegistry final {
         .map([](Entry& entry) -> Entry& { return entry; });
   }
 
+  // PREPARE_SNAPSHOT: see ModuleRegistry::visitEntriesForSnapshot.
+  void visitEntriesForSnapshot(
+      Lock& js, kj::FunctionParam<void(ModuleRegistry::SnapshotEntryRef)> fn) {
+    for (auto& entry: lookupCache) {
+      auto handle = entry.key.getHandle(js);
+      fn(ModuleRegistry::SnapshotEntryRef{
+        .specifier = entry.context.id,
+        .type = entry.context.type,
+        .status = handle->GetStatus(),
+        .handle = handle,
+      });
+    }
+    // Entry.key is a table key, so the Globals cannot be reset in place without corrupting
+    // the hash indices; clearing the table resets every handle via the destructors instead.
+    lookupCache.clear();
+  }
+
+  // START_FROM_SNAPSHOT: see ModuleRegistry::restoreSnapshotEntry.
+  bool restoreEntry(
+      Lock& js, const Url& specifier, ResolveContext::Type type, v8::Local<v8::Module> module) {
+    // Re-resolve the Module definition from the shared registry the same way
+    // resolveWithCaching does: query parameters and fragments are stripped for the inner
+    // lookup only. ResolveContext holds references, so the stripped clone needs a name.
+    auto stripped = specifier.clone(
+        Url::EquivalenceOption::IGNORE_FRAGMENTS | Url::EquivalenceOption::IGNORE_SEARCH);
+    ResolveContext innerContext{
+      .type = type,
+      .source = ResolveContext::Source::INTERNAL,
+      .normalizedSpecifier = stripped,
+      .referrerNormalizedSpecifier = inner.getBundleBase(),
+    };
+    KJ_IF_SOME(found, inner.lookup(innerContext)) {
+      // Cache under the original (unstripped) specifier — the exact key runtime lookups
+      // reproduce — while the baked module handle replaces the getDescriptor() compile.
+      ResolveContext cacheContext{
+        .type = type,
+        .source = ResolveContext::Source::INTERNAL,
+        .normalizedSpecifier = specifier,
+        .referrerNormalizedSpecifier = inner.getBundleBase(),
+      };
+      lookupCache.upsert(
+          Entry{
+            .key = HashableV8Ref<v8::Module>(js.v8Isolate, module),
+            .context = cacheContext,
+            .module = found,
+          },
+          [](auto&, auto&&) {});
+      return true;
+    }
+    return false;
+  }
+
   const jsg::Url& getBundleBase() const {
     return inner.getBundleBase();
   }
@@ -877,6 +937,29 @@ v8::MaybeLocal<v8::Value> SyntheticModule::evaluationSteps(
   }
 }
 
+// Static trampoline backing import.meta.resolve. The referrer href travels as the created
+// function's `data` (a plain JS string), so the function carries no embedder-owned state and
+// can be serialized into a startup snapshot: V8 lazily materializes import.meta per module and
+// caches it on the module, so any module whose top level touched import.meta in the zygote
+// bakes this function into the snapshot. The address is registered as a V8 external reference
+// in the Worker::Isolate constructor (via getImportMetaResolveCallback).
+void importMetaResolveCallback(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  liftKj(info, [&]() -> v8::Local<v8::Value> {
+    auto& js = Lock::from(info.GetIsolate());
+    auto href = kj::str(info.Data());
+    // Note that we intentionally use ToString here to coerce whatever value is given
+    // into a string or throw if it cannot be coerced.
+    auto specifier = js.toString(info[0]);
+    KJ_IF_SOME(resolved, Url::tryParse(specifier.asPtr(), href.asPtr())) {
+      auto normalized = resolved.clone(Url::EquivalenceOption::NORMALIZE_PATH);
+      return js.str(normalized.getHref());
+    }
+    // If the specifier could not be parsed and resolved successfully,
+    // the spec says to return null.
+    return js.null();
+  });
+}
+
 // Set up the special `import.meta` property for the module.
 void importMeta(
     v8::Local<v8::Context> context, v8::Local<v8::Module> module, v8::Local<v8::Object> meta) {
@@ -909,21 +992,8 @@ void importMeta(
         // resolving import specifiers relative to the current modules base URL.
         // Note that we do not validate that the resolved URL actually matches
         // anything in the registry.
-        auto resolve = js.wrapReturningFunction(js.v8Context(),
-            [href = kj::mv(href)](
-                Lock& js, const v8::FunctionCallbackInfo<v8::Value>& args) -> JsValue {
-          // Note that we intentionally use ToString here to coerce whatever value is given
-          // into a string or throw if it cannot be coerced.
-          auto specifier = js.toString(args[0]);
-          KJ_IF_SOME(resolved, Url::tryParse(specifier.asPtr(), href)) {
-            auto normalized = resolved.clone(Url::EquivalenceOption::NORMALIZE_PATH);
-            return js.str(normalized.getHref());
-          } else {
-            // If the specifier could not be parsed and resolved successfully,
-            // the spec says to return null.
-            return js.null();
-          }
-        });
+        auto resolve = check(v8::Function::New(
+            js.v8Context(), &importMetaResolveCallback, v8::Local<v8::Value>(js.str(href))));
 
         if (meta->CreateDataProperty(
                     js.v8Context(), v8::Local<v8::String>(js.strIntern("resolve"_kj)), resolve)
@@ -1870,6 +1940,20 @@ JsValue ModuleRegistry::resolve(Lock& js,
   JSG_FAIL_REQUIRE(Error, kj::str("Module not found: ", specifier));
 }
 
+void ModuleRegistry::visitEntriesForSnapshot(
+    Lock& js, kj::FunctionParam<void(SnapshotEntryRef)> fn) {
+  auto& bound = IsolateModuleRegistry::from(js.v8Isolate);
+  bound.visitEntriesForSnapshot(js, kj::mv(fn));
+}
+
+bool ModuleRegistry::restoreSnapshotEntry(
+    Lock& js, kj::StringPtr specifier, ResolveContext::Type type, v8::Local<v8::Module> module) {
+  auto& bound = IsolateModuleRegistry::from(js.v8Isolate);
+  auto url = KJ_ASSERT_NONNULL(
+      Url::tryParse(specifier), "invalid module specifier in snapshot artifact", specifier);
+  return bound.restoreEntry(js, url, type, module);
+}
+
 // ======================================================================================
 
 Module::Module(Url id, Type type, Flags flags, ContentType contentType)
@@ -2109,6 +2193,14 @@ void requireCallback(const v8::FunctionCallbackInfo<v8::Value>& info) {
 
 v8::FunctionCallback getRequireCallback() {
   return &requireCallback;
+}
+
+intptr_t getSyntheticModuleEvalRef() {
+  return SyntheticModule::getEvalStepsRef();
+}
+
+v8::FunctionCallback getImportMetaResolveCallback() {
+  return &importMetaResolveCallback;
 }
 
 }  // namespace workerd::jsg::modules

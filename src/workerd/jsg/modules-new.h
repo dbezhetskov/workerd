@@ -738,6 +738,34 @@ class ModuleRegistry final: public kj::AtomicRefcounted, public ModuleRegistryBa
       kj::Maybe<const Url&> maybeReferrer = kj::none,
       UnwrapDefault unwrapDefault = UnwrapDefault::NO);
 
+  // One lookup-cache entry of the current context's bound IsolateModuleRegistry, surfaced
+  // while preparing a startup snapshot. Mirrors the old registry's SnapshotHandleRef
+  // (modules.h), but the new registry owns exactly one handle kind: the cached v8::Module.
+  struct SnapshotEntryRef {
+    // The original resolved specifier, query parameters and fragment preserved — this is the
+    // exact cache key a LOAD-time restore must reproduce.
+    const Url& specifier;
+    ResolveContext::Type type;
+    // Drives the pin policy: kUninstantiated entries leaked no identity into the baked heap
+    // and can safely be recompiled fresh at LOAD.
+    v8::Module::Status status;
+    v8::Local<v8::Module> handle;
+  };
+
+  // At PREPARE_SNAPSHOT, visit every cached module of the current context's bound
+  // IsolateModuleRegistry so the caller can AddData-pin the handles, then clear the cache,
+  // resetting every v8::Global in one step (SnapshotCreator::CreateBlob() requires all
+  // embedder global handles cleared). The shared ModuleRegistry itself holds no V8 state
+  // and is untouched.
+  static void visitEntriesForSnapshot(Lock& js, kj::FunctionParam<void(SnapshotEntryRef)> fn);
+
+  // At START_FROM_SNAPSHOT, re-insert a snapshot-baked v8::Module into the current context's
+  // lookup cache under (specifier, type), re-resolving the Module definition from the shared
+  // registry without compiling anything (bypasses Module::getDescriptor). Returns false if the
+  // registry no longer resolves the specifier — possible only for fallback-service modules.
+  static bool restoreSnapshotEntry(
+      Lock& js, kj::StringPtr specifier, ResolveContext::Type type, v8::Local<v8::Module> module);
+
   // The constructor is public because kj::heap requires is to be. Do not
   // use the constructor directly. Use the ModuleRegistry::Builder
   ModuleRegistry(ModuleRegistry::Builder* builder);
@@ -817,5 +845,19 @@ constexpr ModuleRegistry::Builder::Options operator&(
 // zygote live in the JS heap and are serialized into the snapshot. The callback itself lives
 // in an anonymous namespace in modules-new.c++, hence this accessor.
 v8::FunctionCallback getRequireCallback();
+
+// Returns the address of the new-registry SyntheticModule evaluation-steps callback so it can
+// be registered in the V8 external_references array. V8 stores this address as a Foreign inside
+// every synthetic v8::Module created via CreateSyntheticModule, so synthetic modules baked into
+// a startup snapshot need the serializer to encode/resolve it by index. Distinct from the old
+// registry's jsg::getSyntheticModuleEvalRef().
+intptr_t getSyntheticModuleEvalRef();
+
+// Returns the static trampoline backing import.meta.resolve (new module registry). The referrer
+// href travels as the function's `data` (a plain JS string), so the function carries no
+// embedder-owned state. Its address must be registered in the V8 external_references array:
+// import.meta objects materialized in the zygote live in the JS heap and are serialized into
+// the snapshot.
+v8::FunctionCallback getImportMetaResolveCallback();
 
 }  // namespace workerd::jsg::modules

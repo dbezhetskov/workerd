@@ -331,7 +331,8 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
   jsg::SnapshotArtifact& makeSnapshot(kj::StringPtr name,
       WorkerDef& def,
       capnp::List<config::Extension>::Reader extensions,
-      ErrorReporter& errorReporter);
+      ErrorReporter& errorReporter,
+      kj::Maybe<kj::Arc<jsg::modules::ModuleRegistry>> newModuleRegistry);
 
   kj::Promise<void> startServices(jsg::V8System& v8System,
       config::Config::Reader config,
