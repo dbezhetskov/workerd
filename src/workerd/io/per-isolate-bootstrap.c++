@@ -171,6 +171,17 @@ static const v8::CFunction fast_mark_promise_handled_ =
 
 v8::Local<v8::Value> getFastMethodNoSideEffect(
     jsg::Lock& js, v8::FunctionCallback callback, const v8::CFunction* c_function) {
+  if (js.isPreparingSnapshot()) {
+    // FunctionTemplate::New + GetFunction() lands the instantiated function in the
+    // context's template-instantiations cache, where the snapshot serializer finds it and
+    // fatals on the fast-api CFunction Foreign (V8 15.0 can't serialize it; same reason
+    // jsg disables fast API for snapshots, see workerd-api.c++). A bare Function::New is
+    // do-not-cache, so the zygote's function dies with the BootstrapState cleanup before
+    // CreateBlob; the loading context re-runs the bootstrap in a normal isolate and gets
+    // the fast-api version below.
+    return jsg::check(v8::Function::New(js.v8Context(), callback, v8::Local<v8::Value>(), 0,
+        v8::ConstructorBehavior::kThrow, v8::SideEffectType::kHasNoSideEffect));
+  }
   return jsg::check(v8::FunctionTemplate::New(js.v8Isolate, callback, v8::Local<v8::Value>(),
       v8::Local<v8::Signature>(), 0, v8::ConstructorBehavior::kThrow,
       v8::SideEffectType::kHasNoSideEffect, c_function)
@@ -179,6 +190,11 @@ v8::Local<v8::Value> getFastMethodNoSideEffect(
 
 v8::Local<v8::Value> getFastMethod(
     jsg::Lock& js, v8::FunctionCallback callback, const v8::CFunction* c_function) {
+  if (js.isPreparingSnapshot()) {
+    // See getFastMethodNoSideEffect().
+    return jsg::check(v8::Function::New(js.v8Context(), callback, v8::Local<v8::Value>(), 0,
+        v8::ConstructorBehavior::kThrow, v8::SideEffectType::kHasSideEffect));
+  }
   return jsg::check(v8::FunctionTemplate::New(js.v8Isolate, callback, v8::Local<v8::Value>(),
       v8::Local<v8::Signature>(), 0, v8::ConstructorBehavior::kThrow,
       v8::SideEffectType::kHasSideEffect, c_function)
@@ -186,6 +202,11 @@ v8::Local<v8::Value> getFastMethod(
 }
 
 v8::Local<v8::Value> getMethod(jsg::Lock& js, v8::FunctionCallback callback) {
+  if (js.isPreparingSnapshot()) {
+    // See getFastMethodNoSideEffect() — avoid the template-instantiations cache.
+    return jsg::check(v8::Function::New(
+        js.v8Context(), callback, v8::Local<v8::Value>(), 0, v8::ConstructorBehavior::kThrow));
+  }
   return jsg::check(v8::FunctionTemplate::New(js.v8Isolate, callback, v8::Local<v8::Value>(),
       v8::Local<v8::Signature>(), 0, v8::ConstructorBehavior::kThrow)
                         ->GetFunction(js.v8Context()));
@@ -476,7 +497,13 @@ void runPerIsolateBootstrap(jsg::Lock& js, CompatibilityFlags::Reader flags) {
     // require() other scripts. All execution is synchronous.
     state->requireFn.getHandle(js).call(js, js.undefined(), js.strIntern("main"_kj));
 
-    if (!flags.getJsWeakRef()) {
+    // In a snapshot zygote, leave WeakRef/FinalizationRegistry in place: the deletion
+    // would be baked into the blob, and the loading context re-runs this bootstrap,
+    // whose primordials capture would then hit a ReferenceError. The load-side run
+    // takes this branch (normal isolate) and deletes them before any request is
+    // served. Caveat: zygote top-level user code can observe these globals even with
+    // the js_weakref flag off.
+    if (!flags.getJsWeakRef() && !js.isPreparingSnapshot()) {
       jsg::deleteWeakRefGlobals(js.v8Isolate, context);
     }
   }
