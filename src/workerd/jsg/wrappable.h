@@ -432,6 +432,14 @@ class HeapTracer: public v8::EmbedderRootsHandler {
   // can keep them alive.
   [[nodiscard]] kj::Vector<kj::Own<Wrappable>> resetLiveWrappableInstances();
 
+  // Run every live Wrappable's jsgVisitForGc with a snapshot-reset GcVisitor: each visited
+  // member handle (jsg::Data/V8Ref fields such as EventTarget listeners or lazy JsRef caches)
+  // is pinned via `pin` (typically SnapshotCreator::AddData) and then Reset so it does not
+  // trip CreateBlob's CheckGlobalAndEternalHandles. PREPARE_SNAPSHOT pipeline only; the
+  // matching type is GcVisitor::SnapshotPin (spelled out here because GcVisitor is defined
+  // later, in jsg.h).
+  void pinAndResetMemberHandlesForSnapshot(kj::Function<void(v8::Local<v8::Data>)>& pin);
+
   void addToFreelist(Wrappable::CppgcShim& shim);
   Wrappable::CppgcShim* allocateShim(Wrappable& wrappable);
   void clearFreelistedShims();

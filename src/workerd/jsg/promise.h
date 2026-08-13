@@ -355,6 +355,14 @@ class Promise {
       return {js.v8Isolate, v8Resolver.getHandle(js)};
     }
     void visitForGc(GcVisitor& visitor) {
+      // In snapshot-reset mode the resolver's promise (with its reactions, which may carry
+      // unserializable C++ continuation functions) must not be pinned into the snapshot —
+      // drop the handle instead; a resolver pending at snapshot time never settles in
+      // workers started from the snapshot.
+      if (visitor.isSnapshotReset()) {
+        visitor.dropForSnapshot(v8Resolver);
+        return;
+      }
       visitor.visit(v8Resolver);
     }
 
@@ -368,6 +376,17 @@ class Promise {
   };
 
   void visitForGc(GcVisitor& visitor) {
+    // In snapshot-reset mode a promise must not be pinned into the snapshot: its reactions
+    // may carry C++ continuation functions (jsg::promiseContinuation templates with opaque
+    // native data) that cannot be serialized. Drop the handle instead; a promise pending at
+    // snapshot time never settles in workers started from the snapshot.
+    if (visitor.isSnapshotReset()) {
+      KJ_IF_SOME(promise, v8Promise) {
+        visitor.dropForSnapshot(promise);
+      }
+      v8Promise = kj::none;
+      return;
+    }
     visitor.visit(v8Promise);
   }
 

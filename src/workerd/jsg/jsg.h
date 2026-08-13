@@ -2284,6 +2284,17 @@ consteval bool hasPublicVisitForGc() {
 // that the reference graph is a DAG, just like you always would in C++.
 class GcVisitor {
  public:
+  // Callback used in snapshot-reset mode: receives each visited member handle's value so the
+  // caller can pin it into the snapshot (SnapshotCreator::AddData) before the handle is Reset.
+  using SnapshotPin = kj::Function<void(v8::Local<v8::Data>)>;
+
+  // True when this visitor runs in snapshot-reset mode (PREPARE_SNAPSHOT pipeline): every
+  // visited handle is pinned and then dropped instead of being strength-adjusted. Lets
+  // visitForGc implementations expose snapshot-only edges that a normal GC visit must skip.
+  bool isSnapshotReset() const {
+    return snapshotPin != kj::none;
+  }
+
   template <typename T>
   void visit(Ref<T>& ref) {
     ref.inner->visitRef(*this, ref.parent, ref.strong);
@@ -2297,6 +2308,16 @@ class GcVisitor {
   }
 
   void visit(Data& data);
+
+  // In snapshot-reset mode, drop the handle WITHOUT pinning it into the snapshot — for
+  // values that cannot be serialized at all, e.g. promises whose reactions carry C++
+  // continuation functions (template callbacks + opaque native data). No-op otherwise.
+  void dropForSnapshot(Data& data);
+
+  template <typename T>
+  void dropForSnapshot(V8Ref<T>& value) {
+    dropForSnapshot(static_cast<Data&>(value));
+  }
 
   /// Visit a raw `v8::Global<Value>` + `v8::TracedReference<Data>` pair,
   /// implementing the same strong↔traced dual-mode switching as `visit(Data&)`.
@@ -2357,9 +2378,18 @@ class GcVisitor {
   Wrappable& parent;
   kj::Maybe<cppgc::Visitor&> cppgcVisitor;
 
+  // Non-none in snapshot-reset mode. Only ever set while the PREPARE_SNAPSHOT pipeline drains
+  // resource member handles before CreateBlob; the zygote is discarded right afterwards, so
+  // the emptied C++ handles are never used again.
+  kj::Maybe<SnapshotPin&> snapshotPin;
+
   explicit GcVisitor(Wrappable& parent, kj::Maybe<cppgc::Visitor&> cppgcVisitor)
       : parent(parent),
         cppgcVisitor(cppgcVisitor) {}
+
+  explicit GcVisitor(Wrappable& parent, SnapshotPin& snapshotPin)
+      : parent(parent),
+        snapshotPin(snapshotPin) {}
   KJ_DISALLOW_COPY_AND_MOVE(GcVisitor);
 
   friend class Wrappable;
