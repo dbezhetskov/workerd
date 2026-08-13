@@ -414,6 +414,11 @@ class EventTarget: public jsg::Object {
   kj::Own<void> newNativeHandler(
       jsg::Lock& js, kj::String type, jsg::Function<void(jsg::Ref<Event>)> func, bool once = false);
 
+  // Enumerates JS-registered listeners for the live-snapshot PREPARE pass, in per-type
+  // insertion order. Native listeners are skipped (their C++ owners re-register on load).
+  void forEachSnapshotListener(jsg::Lock& js,
+      kj::FunctionParam<void(kj::StringPtr type, v8::Local<v8::Object> identity, bool once)> cb);
+
   void visitForMemoryInfo(jsg::MemoryTracker& tracker) const;
 
  protected:

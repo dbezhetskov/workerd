@@ -222,6 +222,26 @@ kj::Array<kj::StringPtr> EventTarget::getHandlerNames() const {
   return KJ_MAP(entry, typeMap) { return entry.key.asPtr(); };
 }
 
+void EventTarget::forEachSnapshotListener(jsg::Lock& js,
+    kj::FunctionParam<void(kj::StringPtr type, v8::Local<v8::Object> identity, bool once)> cb) {
+  for (auto& entry: typeMap) {
+    for (auto& handler: entry.value.handlers.ordered<kj::InsertionOrderIndex>()) {
+      KJ_SWITCH_ONEOF(handler->handler) {
+        KJ_CASE_ONEOF(jsh, EventHandler::JavaScriptHandler) {
+          KJ_REQUIRE(jsh.abortHandler == kj::none,
+              "snapshot PoC: top-level addEventListener with a `signal` option is not supported",
+              entry.key);
+          cb(entry.key, jsh.identity.getHandle(js), handler->once);
+        }
+        KJ_CASE_ONEOF(native, EventHandler::NativeHandlerRef) {
+          // Owned by the zygote's C++ state; the loaded worker's own C++ re-registers
+          // equivalents, so native listeners are not transferred through the snapshot.
+        }
+      }
+    }
+  }
+}
+
 void EventTarget::addEventListener(jsg::Lock& js,
     kj::String type,
     kj::Maybe<jsg::Identified<Handler>> maybeHandler,

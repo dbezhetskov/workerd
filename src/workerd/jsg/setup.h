@@ -401,8 +401,14 @@ class IsolateBase {
   // class cannot enumerate itself (e.g. the Rust JSG Realm's resource-template cache, which jsg
   // cannot depend on). Each one is pinned into the snapshot and disposed before CreateBlob;
   // the caches are expected to rebuild the templates lazily on demand.
+  //
+  // `listenerRecords` carries the zygote global's event-listener records collected by the
+  // caller (which pinned each identity object via getSnapshotCreator()->AddData before the
+  // member-handle reset in here drops them); they are stored in the SnapshotArtifact for the
+  // LOAD side to replay. Collected at the io layer because jsg cannot see api::EventTarget.
   void prepareSnapshot(v8::Global<v8::Context> defaultContext,
-      kj::Vector<v8::Global<v8::FunctionTemplate>> extraTemplateHandles = {});
+      kj::Vector<v8::Global<v8::FunctionTemplate>> extraTemplateHandles = {},
+      kj::Vector<SnapshotArtifact::ListenerRecord> listenerRecords = {});
 
   // Replays the entries collected by snapshotDeserializeInternalFields() once Context::New()
   // has returned: clones each artifact original and attaches the clone to its snapshot-restored
