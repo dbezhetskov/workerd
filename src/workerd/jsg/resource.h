@@ -1367,6 +1367,12 @@ struct ResourceTypeBuilder {
         // so it must outlive the FunctionTemplate. This register function is a unique template
         // instantiation per method, so a function-local static gives us exactly one persistent
         // CFunction per registered method.
+        //
+        // The same pointer is what a startup snapshot serializes: V8 keeps &cFunction in a
+        // Foreign<kCFunctionTag> on the FunctionTemplateInfo and re-reads GetAddress() and
+        // GetTypeInfo() from the object on load, so the object's own address is the one external
+        // reference the fast path needs (the static lifetime also keeps that address stable); the
+        // fast callback and CFunctionInfo pointers never appear in the heap themselves.
         static const auto cFunction = v8::CFunction::Make(Mcb::template fastCallback<>);
         auto functionTemplate = v8::FunctionTemplate::NewWithCFunctionOverloads(isolate,
             &Mcb::callback, v8::Local<v8::Value>(), signature, length,
@@ -1374,8 +1380,7 @@ struct ResourceTypeBuilder {
 
         prototype->Set(isolate, name, functionTemplate);
         registerExternalReference(&Mcb::callback);
-        registerExternalReference(Mcb::template fastCallback<>);
-        registerExternalReference(cFunction.GetTypeInfo());
+        registerExternalReference(&cFunction);
         return;
       }
     }
@@ -1409,8 +1414,7 @@ struct ResourceTypeBuilder {
         functionTemplate->RemovePrototype();
         constructor->Set(v8StrIntern(isolate, name), functionTemplate);
         registerExternalReference(&Smcb::callback);
-        registerExternalReference(Smcb::template fastCallback<>);
-        registerExternalReference(cFunction.GetTypeInfo());
+        registerExternalReference(&cFunction);
         return;
       }
     }
@@ -1472,8 +1476,8 @@ struct ResourceTypeBuilder {
             v8::ConstructorBehavior::kThrow, v8::SideEffectType::kHasSideEffect,
             {&setterCFunction, 1});
 
-        registerExternalReference(getterCFunction.GetTypeInfo());
-        registerExternalReference(setterCFunction.GetTypeInfo());
+        registerExternalReference(&getterCFunction);
+        registerExternalReference(&setterCFunction);
 
         useSlowApi = false;
       }
@@ -1506,12 +1510,6 @@ struct ResourceTypeBuilder {
         Gcb::enumerable ? v8::PropertyAttribute::None : v8::PropertyAttribute::DontEnum);
     registerExternalReference(&Gcb::callback);
     registerExternalReference(&Scb::callback);
-    if constexpr (isFastApiCompatible<Getter> && isFastApiCompatible<Setter>) {
-      if (typeWrapper.isFastApiEnabled()) {
-        registerExternalReference(Gcb::template fastCallback<>);
-        registerExternalReference(Scb::template fastCallback<>);
-      }
-    }
   }
 
   template <const char* name, typename Getter, Getter getter>

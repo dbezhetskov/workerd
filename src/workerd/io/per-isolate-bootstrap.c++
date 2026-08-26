@@ -9,6 +9,7 @@
 #include <workerd/io/compatibility-date.h>
 #include <workerd/jsg/jsg.h>
 #include <workerd/jsg/jsvalue.h>
+#include <workerd/jsg/setup.h>
 #include <workerd/jsg/util.h>
 #include <workerd/util/autogate.h>
 
@@ -169,47 +170,40 @@ static void CreateDigestContext(const v8::FunctionCallbackInfo<v8::Value>& args)
 static const v8::CFunction fast_mark_promise_handled_ =
     v8::CFunction::Make(MarkPromiseHandledFastApi);
 
-v8::Local<v8::Value> getFastMethodNoSideEffect(
-    jsg::Lock& js, v8::FunctionCallback callback, const v8::CFunction* c_function) {
-  if (js.isPreparingSnapshot()) {
-    // FunctionTemplate::New + GetFunction() lands the instantiated function in the
-    // context's template-instantiations cache, where the snapshot serializer finds it and
-    // fatals on the fast-api CFunction Foreign (V8 15.0 can't serialize it; same reason
-    // jsg disables fast API for snapshots, see workerd-api.c++). A bare Function::New is
-    // do-not-cache, so the zygote's function dies with the BootstrapState cleanup before
-    // CreateBlob; the loading context re-runs the bootstrap in a normal isolate and gets
-    // the fast-api version below.
-    return jsg::check(v8::Function::New(js.v8Context(), callback, v8::Local<v8::Value>(), 0,
-        v8::ConstructorBehavior::kThrow, v8::SideEffectType::kHasNoSideEffect));
+// Builds one `utils` method. The functions built here reach a startup snapshot whenever the
+// bootstrap runs in a zygote: GetFunction() lands the instance in the context's
+// template-instantiations cache, and the TypeScript stream classes installed on globalThis close
+// over the `utils` object through the CompileFunction context extension. So every C++ address V8
+// serializes for them is registered as an external reference: the slow callback and, for fast
+// methods, the v8::CFunction object itself (V8 keeps &c_function in a Foreign<kCFunctionTag> and
+// re-reads GetAddress()/GetTypeInfo() from it on load, which is also why the CFunctions above are
+// file-level statics). Registration is a no-op outside PREPARE_SNAPSHOT, so normal isolates are
+// unaffected.
+v8::Local<v8::Value> makeMethod(jsg::Lock& js,
+    v8::FunctionCallback callback,
+    v8::SideEffectType sideEffect,
+    const v8::CFunction* c_function = nullptr) {
+  jsg::isolateRegisterExternalReference(js.v8Isolate, reinterpret_cast<intptr_t>(callback));
+  if (c_function != nullptr) {
+    jsg::isolateRegisterExternalReference(js.v8Isolate, reinterpret_cast<intptr_t>(c_function));
   }
   return jsg::check(v8::FunctionTemplate::New(js.v8Isolate, callback, v8::Local<v8::Value>(),
-      v8::Local<v8::Signature>(), 0, v8::ConstructorBehavior::kThrow,
-      v8::SideEffectType::kHasNoSideEffect, c_function)
+      v8::Local<v8::Signature>(), 0, v8::ConstructorBehavior::kThrow, sideEffect, c_function)
                         ->GetFunction(js.v8Context()));
+}
+
+v8::Local<v8::Value> getFastMethodNoSideEffect(
+    jsg::Lock& js, v8::FunctionCallback callback, const v8::CFunction* c_function) {
+  return makeMethod(js, callback, v8::SideEffectType::kHasNoSideEffect, c_function);
 }
 
 v8::Local<v8::Value> getFastMethod(
     jsg::Lock& js, v8::FunctionCallback callback, const v8::CFunction* c_function) {
-  if (js.isPreparingSnapshot()) {
-    // See getFastMethodNoSideEffect().
-    return jsg::check(v8::Function::New(js.v8Context(), callback, v8::Local<v8::Value>(), 0,
-        v8::ConstructorBehavior::kThrow, v8::SideEffectType::kHasSideEffect));
-  }
-  return jsg::check(v8::FunctionTemplate::New(js.v8Isolate, callback, v8::Local<v8::Value>(),
-      v8::Local<v8::Signature>(), 0, v8::ConstructorBehavior::kThrow,
-      v8::SideEffectType::kHasSideEffect, c_function)
-                        ->GetFunction(js.v8Context()));
+  return makeMethod(js, callback, v8::SideEffectType::kHasSideEffect, c_function);
 }
 
 v8::Local<v8::Value> getMethod(jsg::Lock& js, v8::FunctionCallback callback) {
-  if (js.isPreparingSnapshot()) {
-    // See getFastMethodNoSideEffect() — avoid the template-instantiations cache.
-    return jsg::check(v8::Function::New(
-        js.v8Context(), callback, v8::Local<v8::Value>(), 0, v8::ConstructorBehavior::kThrow));
-  }
-  return jsg::check(v8::FunctionTemplate::New(js.v8Isolate, callback, v8::Local<v8::Value>(),
-      v8::Local<v8::Signature>(), 0, v8::ConstructorBehavior::kThrow)
-                        ->GetFunction(js.v8Context()));
+  return makeMethod(js, callback, v8::SideEffectType::kHasSideEffect);
 }
 
 // Creates an object with methods for performing fast type checks on JS values.
@@ -310,7 +304,11 @@ kj::StringPtr normalizeSpecifier(kj::StringPtr specifier) {
   return specifier;
 }
 
-// The V8 callback backing the require() function injected into bootstrap scripts.
+// The V8 callback backing the require() function injected into bootstrap scripts. The function
+// is reachable from every closure a bootstrap script creates (through the CompileFunction context
+// extension that carries the pseudo-globals), so it is serialized along with a zygote context;
+// its address is registered as a snapshot external reference where the function is created in
+// runPerIsolateBootstrap().
 void requireCallback(const v8::FunctionCallbackInfo<v8::Value>& info) {
   jsg::liftKj(info.GetIsolate(), [&] {
     auto& js = jsg::Lock::from(info.GetIsolate());
@@ -481,6 +479,7 @@ void runPerIsolateBootstrap(jsg::Lock& js, CompatibilityFlags::Reader flags) {
 
   // Create the require() function. No v8::External needed — the callback
   // reads state from the context embedder slot.
+  jsg::isolateRegisterExternalReference(js.v8Isolate, reinterpret_cast<intptr_t>(&requireCallback));
   state->requireFn =
       jsg::JsFunction(jsg::check(v8::Function::New(context, requireCallback))).addRef(js);
 
