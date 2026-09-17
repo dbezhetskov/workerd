@@ -6,10 +6,18 @@
 
 #include <workerd/io/io-util.h>
 #include <workerd/io/limit-enforcer.h>
+#include <workerd/io/worker.h>
 
 #include <kj/encoding.h>
 
 namespace workerd::api {
+
+kj::Maybe<kj::Own<jsg::Wrappable>> Performance::snapshotClone() const {
+  KJ_REQUIRE(entries.size() == 0,
+      "Performance with recorded entries cannot be cloned for the startup snapshot");
+  auto& js = jsg::Lock::current();
+  return ownAsWrappable(kj::refcounted<Performance>(Worker::Isolate::from(js).getLimitEnforcer()));
+}
 
 double Performance::now(jsg::Lock& js) {
   // We define performance.now() for compatibility purposes, but due to Spectre concerns it

@@ -518,6 +518,11 @@ class Performance: public EventTarget {
   explicit Performance(const IsolateLimitEnforcer& isolateLimitEnforcer)
       : isolateLimitEnforcer(isolateLimitEnforcer) {}
 
+  bool isSnapshotClonable() const override {
+    return entries.size() == 0;
+  }
+  kj::Maybe<kj::Own<jsg::Wrappable>> snapshotClone() const override;
+
   // We always return a time origin of 0, making performance.now() equivalent to Date.now(). There
   // is no other appropriate time origin to use given that the Worker platform is intended to be
   // treated like one big computer rather than many individual instances. In particular, if and
