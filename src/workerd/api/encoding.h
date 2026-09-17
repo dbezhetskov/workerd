@@ -30,7 +30,7 @@ class IcuDecoder final: public Decoder {
 
   static kj::Maybe<IcuDecoder> create(Encoding encoding, bool fatal, bool ignoreBom);
 
-  Encoding getEncoding() override {
+  Encoding getEncoding() const override {
     return encoding;
   }
 
@@ -89,6 +89,12 @@ class TextDecoder final: public jsg::Object {
     return ctorOptions.ignoreBOM;
   }
 
+  // If there is no state then clonining is available.
+  bool isSnapshotClonable() const override {
+    return !midStream;
+  }
+  kj::Maybe<kj::Own<jsg::Wrappable>> snapshotClone() const override;
+
   JSG_RESOURCE_TYPE(TextDecoder, CompatibilityFlags::Reader flags) {
     JSG_METHOD(decode);
     if (flags.getJsgPropertyOnPrototypeTemplate()) {
@@ -122,6 +128,11 @@ class TextDecoder final: public jsg::Object {
 
   DecoderImpl decoder;
   ConstructorOptions ctorOptions;
+
+  // True after a non-flushing decode: the implementation may be holding an incomplete
+  // multi-byte sequence (or has already consumed a BOM), so it cannot be rebuilt from the
+  // constructor arguments alone. Maintained by decodePtr(), the single decode entry point.
+  bool midStream = false;
 
   static const DecodeOptions DEFAULT_OPTIONS;
   static constexpr kj::byte DUMMY = 0;

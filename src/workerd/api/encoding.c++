@@ -499,17 +499,44 @@ jsg::JsString TextDecoder::decode(jsg::Lock& js,
   auto options = maybeOptions.orDefault(DEFAULT_OPTIONS);
   auto& input = maybeInput.orDefault(EMPTY);
   return JSG_REQUIRE_NONNULL(
-      getImpl().decode(js, input, !options.stream), TypeError, "Failed to decode input.");
+      decodePtr(js, input, !options.stream), TypeError, "Failed to decode input.");
 }
 
 kj::Maybe<jsg::JsString> TextDecoder::decodePtr(
     jsg::Lock& js, kj::ArrayPtr<const kj::byte> buffer, bool flush) {
+  // A flushing decode always leaves the implementation reset (IcuDecoder::decode() resets on
+  // flush via KJ_DEFER, even on failure; the encoding_rs decoder resets lazily on its next
+  // call), so the buffered-state flag tracks the flush bit alone. Set before the call so a
+  // failed or throwing non-flush decode, which may have consumed part of the input,
+  // conservatively counts as mid-stream.
+  midStream = !flush;
   KJ_SWITCH_ONEOF(decoder) {
     KJ_CASE_ONEOF(dec, LegacyDecoder) {
       return dec.decode(js, buffer, flush);
     }
     KJ_CASE_ONEOF(dec, IcuDecoder) {
       return dec.decode(js, buffer, flush);
+    }
+  }
+  KJ_UNREACHABLE;
+}
+
+kj::Maybe<kj::Own<jsg::Wrappable>> TextDecoder::snapshotClone() const {
+  // Paired with isSnapshotClonable(): the PREPARE_SNAPSHOT gate already rejected mid-stream
+  // decoders, so this only guards against a desync between the two.
+  KJ_REQUIRE(!midStream,
+      "TextDecoder with buffered stream state cannot be cloned for the startup snapshot");
+  auto rebuild = [&](DecoderImpl impl) {
+    return ownAsWrappable(kj::refcounted<TextDecoder>(kj::mv(impl), ctorOptions));
+  };
+  KJ_SWITCH_ONEOF(decoder) {
+    KJ_CASE_ONEOF(dec, LegacyDecoder) {
+      return rebuild(LegacyDecoder(dec.getEncoding(), DecoderFatal(ctorOptions.fatal)));
+    }
+    KJ_CASE_ONEOF(dec, IcuDecoder) {
+      auto fresh = IcuDecoder::create(dec.getEncoding(), ctorOptions.fatal, ctorOptions.ignoreBOM);
+      return rebuild(kj::mv(KJ_ASSERT_NONNULL(
+          fresh, "IcuDecoder::create() failed for an encoding it previously created")));
     }
   }
   KJ_UNREACHABLE;
