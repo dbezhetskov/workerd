@@ -87,6 +87,19 @@ class DiagnosticsChannelModule: public jsg::Object {
   DiagnosticsChannelModule() = default;
   DiagnosticsChannelModule(jsg::Lock&, const jsg::Url&) {}
 
+  // The module singleton is stateless until the first channel() call. Channels hold
+  // jsg::Ref<Channel> (JS-handle state: subscribers, bound stores, possibly a Symbol name),
+  // which snapshotClone() may not carry, so a module with live channels is reported to the
+  // strict gate instead of being silently cloned without them.
+  bool isSnapshotClonable() const override {
+    return channels.size() == 0;
+  }
+  kj::Maybe<kj::Own<jsg::Wrappable>> snapshotClone() const override {
+    KJ_REQUIRE(channels.size() == 0,
+        "DiagnosticsChannelModule with live channels cannot be cloned for a snapshot");
+    return ownAsWrappable(kj::refcounted<DiagnosticsChannelModule>());
+  }
+
   bool hasSubscribers(jsg::Lock& js, jsg::Name name);
   jsg::Ref<Channel> channel(jsg::Lock& js, jsg::Name name);
   void subscribe(jsg::Lock& js, jsg::Name name, jsg::Identified<Channel::MessageCallback> callback);
