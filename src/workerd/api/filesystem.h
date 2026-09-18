@@ -246,6 +246,12 @@ class FileSystemWritableFileStream;
 // underlying file or directory is checked each time an operation is performed on the handle.
 //
 // Two handles are considered the same if they point to the same location and have the same type.
+//
+// Because a handle is nothing more than a locator and a name, it survives a V8 startup snapshot
+// as exactly that: the clone re-resolves against the VFS of the worker it is restored into,
+// which is built from the same configuration as the zygote's. A handle to a temporary file
+// created during top-level evaluation is stale after restore, but it is equally stale without
+// a snapshot (the top-level TmpDirStoreScope is discarded once evaluation finishes).
 class FileSystemHandle: public jsg::Object {
   // TODO(node-fs): The spec defines FileSystemHandle objects as being
   // serializable, meaning that they should work with structured cloning.
@@ -257,7 +263,10 @@ class FileSystemHandle: public jsg::Object {
   // file handle. It would still likely be useful tho. As a follow up
   // step, we will implement serialization/deserialization of these objects.
  public:
-  FileSystemHandle(const workerd::VirtualFileSystem& vfs, jsg::Url&& locator, jsg::USVString name);
+  // `vfs` is kj::none only for handles restored from a startup snapshot; see getVfs().
+  FileSystemHandle(kj::Maybe<const workerd::VirtualFileSystem&> vfs,
+      jsg::Url&& locator,
+      jsg::USVString name);
 
   const jsg::USVString& getName(jsg::Lock& js) {
     return name;
@@ -294,13 +303,30 @@ class FileSystemHandle: public jsg::Object {
     return locator;
   }
   const workerd::VirtualFileSystem& getVfs() const {
-    return vfs;
+    KJ_IF_SOME(v, vfs) {
+      return v;
+    }
+    // Restored from a startup snapshot. The zygote's VFS is gone and the restore pass runs
+    // before Worker::Script::installVirtualFileSystemOnContext(), so the VFS could not be
+    // captured at clone time; every handle method runs under the isolate lock with the
+    // worker's context entered, and the lookup is a single embedder-slot read.
+    return workerd::VirtualFileSystem::current(jsg::Lock::current());
   }
 
   bool canBeModifiedCurrently(jsg::Lock&) const;
 
+  // Shared body of the snapshotClone() overrides in the two concrete handle types. The
+  // original's `vfs` reference dangles by the time this runs (see getVfs()), so only the
+  // locator and name are copied; the clone binds to the new worker's VFS lazily.
+  template <typename T>
+  kj::Own<jsg::Wrappable> snapshotCloneAs() const {
+    return ownAsWrappable(
+        kj::refcounted<T>(kj::none, locator.clone(), jsg::USVString(kj::str(name))));
+  }
+
  private:
-  const workerd::VirtualFileSystem& vfs;
+  // kj::none only for handles restored from a startup snapshot; resolved lazily by getVfs().
+  kj::Maybe<const workerd::VirtualFileSystem&> vfs;
   const jsg::Url locator;
   jsg::USVString name;
 };
@@ -321,10 +347,17 @@ using FileSystemWritableData =
 class FileSystemFileHandle final: public FileSystemHandle {
  public:
   FileSystemFileHandle(
-      const workerd::VirtualFileSystem& vfs, jsg::Url locator, jsg::USVString name);
+      kj::Maybe<const workerd::VirtualFileSystem&> vfs, jsg::Url locator, jsg::USVString name);
 
   kj::StringPtr getKind(jsg::Lock& js) override {
     return "file"_kj;
+  }
+
+  bool isSnapshotClonable() const override {
+    return true;
+  }
+  kj::Maybe<kj::Own<jsg::Wrappable>> snapshotClone() const override {
+    return snapshotCloneAs<FileSystemFileHandle>();
   }
 
   struct FileSystemCreateWritableOptions {
@@ -407,10 +440,17 @@ class FileSystemDirectoryHandle final: public FileSystemHandle {
 
  public:
   FileSystemDirectoryHandle(
-      const workerd::VirtualFileSystem& vfs, jsg::Url locator, jsg::USVString name);
+      kj::Maybe<const workerd::VirtualFileSystem&> vfs, jsg::Url locator, jsg::USVString name);
 
   kj::StringPtr getKind(jsg::Lock& js) override {
     return "directory"_kj;
+  }
+
+  bool isSnapshotClonable() const override {
+    return true;
+  }
+  kj::Maybe<kj::Own<jsg::Wrappable>> snapshotClone() const override {
+    return snapshotCloneAs<FileSystemDirectoryHandle>();
   }
 
   struct FileSystemGetFileOptions {

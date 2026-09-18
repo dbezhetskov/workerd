@@ -2054,14 +2054,14 @@ jsg::Ref<jsg::DOMException> fsErrorToDomException(jsg::Lock& js, workerd::FsErro
 }  // namespace
 
 FileSystemHandle::FileSystemHandle(
-    const workerd::VirtualFileSystem& vfs, jsg::Url&& locator, jsg::USVString name)
+    kj::Maybe<const workerd::VirtualFileSystem&> vfs, jsg::Url&& locator, jsg::USVString name)
     : vfs(vfs),
       locator(kj::mv(locator)),
       name(kj::mv(name)) {}
 
 jsg::Promise<kj::StringPtr> FileSystemHandle::getUniqueId(
     jsg::Lock& js, const jsg::TypeHandler<jsg::Ref<jsg::DOMException>>& deHandler) {
-  KJ_IF_SOME(item, vfs.resolve(js, getLocator(), {})) {
+  KJ_IF_SOME(item, getVfs().resolve(js, getLocator(), {})) {
     KJ_SWITCH_ONEOF(item) {
       KJ_CASE_ONEOF(file, kj::Rc<workerd::File>) {
         return js.resolvedPromise(file->getUniqueId(js));
@@ -2108,7 +2108,8 @@ jsg::Promise<void> FileSystemHandle::remove(jsg::Lock& js,
   auto relative = getLocator().getRelative(jsg::Url::RelativeOption::STRIP_TAILING_SLASHES);
   auto opts = options.orDefault(RemoveOptions{});
   auto recursive = opts.recursive.orDefault(false);
-  KJ_IF_SOME(parent, vfs.resolve(js, relative.base, workerd::VirtualFileSystem::ResolveOptions{})) {
+  KJ_IF_SOME(parent,
+      getVfs().resolve(js, relative.base, workerd::VirtualFileSystem::ResolveOptions{})) {
     KJ_SWITCH_ONEOF(parent) {
       KJ_CASE_ONEOF(parentDir, kj::Rc<workerd::Directory>) {
         // Webfs requires that the entry exists before we try to remove it.
@@ -2168,7 +2169,7 @@ jsg::Promise<jsg::Ref<FileSystemDirectoryHandle>> StorageManager::getDirectory(
 }
 
 FileSystemDirectoryHandle::FileSystemDirectoryHandle(
-    const workerd::VirtualFileSystem& vfs, jsg::Url locator, jsg::USVString name)
+    kj::Maybe<const workerd::VirtualFileSystem&> vfs, jsg::Url locator, jsg::USVString name)
     : FileSystemHandle(vfs, kj::mv(locator), kj::mv(name)) {}
 
 jsg::Promise<jsg::Ref<FileSystemFileHandle>> FileSystemDirectoryHandle::getFileHandle(jsg::Lock& js,
@@ -2566,7 +2567,7 @@ void FileSystemDirectoryHandle::forEach(jsg::Lock& js,
 }
 
 FileSystemFileHandle::FileSystemFileHandle(
-    const workerd::VirtualFileSystem& vfs, jsg::Url locator, jsg::USVString name)
+    kj::Maybe<const workerd::VirtualFileSystem&> vfs, jsg::Url locator, jsg::USVString name)
     : FileSystemHandle(vfs, kj::mv(locator), kj::mv(name)) {}
 
 jsg::Promise<jsg::Ref<File>> FileSystemFileHandle::getFile(
