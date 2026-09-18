@@ -105,6 +105,21 @@ class AsyncLocalStorage final: public jsg::Object {
 
   kj::Arc<jsg::AsyncContextFrame::StorageKey> getKey();
 
+  // Clonable only without a defaultValue: it is a JS handle, which the snapshot clone contract
+  // forbids and which the generic member-handle reset has already dropped by CreateBlob. The
+  // clone mints a fresh StorageKey: any AsyncContextFrame or diagnostics Channel holding the
+  // old key is itself unclonable, so a snapshot that passed the gate references no old key.
+  bool isSnapshotClonable() const override {
+    return defaultValue == kj::none;
+  }
+  kj::Maybe<kj::Own<jsg::Wrappable>> snapshotClone() const override {
+    KJ_REQUIRE(defaultValue == kj::none,
+        "AsyncLocalStorage with a defaultValue cannot be cloned for the startup snapshot");
+    auto clone = kj::refcounted<AsyncLocalStorage>();
+    clone->name = name.map([](const kj::String& n) { return kj::str(n); });
+    return ownAsWrappable(kj::mv(clone));
+  }
+
  private:
   kj::Arc<jsg::AsyncContextFrame::StorageKey> key;
   kj::Maybe<jsg::JsRef<jsg::JsValue>> defaultValue;
@@ -170,6 +185,9 @@ class AsyncResource final: public jsg::Object {
 
   AsyncResource(jsg::Lock& js);
 
+  // Root-frame resource with no captured frame or IoContext; used by snapshotClone().
+  AsyncResource() = default;
+
   // While Node.js' API expects the first argument passed to the `new AsyncResource(...)`
   // constructor to be a string specifying the resource type, we do not actually use it
   // for anything. We'll just ignore the value and not store it, but we at least need to
@@ -209,6 +227,17 @@ class AsyncResource final: public jsg::Object {
 
   // No-op. We do not track resource lifetimes. This is provided only for API compatibility.
   void emitDestroy(jsg::Lock&) {};
+
+  // Clonable only when created in the root frame: a captured AsyncContextFrame is a jsg::Ref
+  // (forbidden by the clone contract) and would need a paired frame/key restore.
+  bool isSnapshotClonable() const override {
+    return frame == kj::none;
+  }
+  kj::Maybe<kj::Own<jsg::Wrappable>> snapshotClone() const override {
+    KJ_REQUIRE(frame == kj::none,
+        "AsyncResource bound to an AsyncContextFrame cannot be cloned for the startup snapshot");
+    return ownAsWrappable(kj::refcounted<AsyncResource>());
+  }
 
   JSG_RESOURCE_TYPE(AsyncResource) {
     JSG_STATIC_METHOD_NAMED(bind, staticBind);
