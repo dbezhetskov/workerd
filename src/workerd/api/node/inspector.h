@@ -106,6 +106,14 @@ class InspectorModule final: public jsg::Object {
   InspectorModule() = default;
   InspectorModule(jsg::Lock&, const jsg::Url&) {}
 
+  // Stateless module object, safe to recreate for a worker started from a snapshot.
+  bool isSnapshotClonable() const override {
+    return true;
+  }
+  kj::Maybe<kj::Own<jsg::Wrappable>> snapshotClone() const override {
+    return ownAsWrappable(kj::refcounted<InspectorModule>());
+  }
+
   JSG_RESOURCE_TYPE(InspectorModule) {
     JSG_NESTED_TYPE_NAMED(InspectorConnection, Connection);
   }
