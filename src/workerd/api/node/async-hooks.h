@@ -9,6 +9,21 @@
 
 namespace workerd::api::node {
 
+// Trampolines behind the functions returned by AsyncLocalStorage.bind()/snapshot() and
+// AsyncResource.bind(). Each such function is `Function.prototype.bind` applied to a data-less
+// v8::Function of one of these callbacks, with the per-function state bound as the four leading
+// arguments [fn, thisArg, originIoContextId, frame]: `fn` is the wrapped function (undefined for
+// the snapshot form, which takes it as its first call argument), `originIoContextId` is undefined
+// or the BigInt of the IoContext::Id the function was created in, and `frame` is undefined (root)
+// or the opaque wrapper of the jsg::AsyncContextFrame to enter. No C++ state is captured, so such
+// functions can be created while preparing a startup snapshot; the JSG_RESOURCE_TYPE blocks below
+// register the callback addresses as external references. The state rides in the bound-argument
+// list rather than in v8::Function data on purpose: V8 serializes a FunctionTemplateInfo (and
+// everything reachable from its data) at isolate level, where context objects such as functions
+// or the global proxy are not allowed, while a bound function is an ordinary context object.
+void boundFunctionCallback(const v8::FunctionCallbackInfo<v8::Value>& info);
+void snapshotFunctionCallback(const v8::FunctionCallbackInfo<v8::Value>& info);
+
 // Implements a subset of the Node.js AsyncLocalStorage API.
 //
 // Example:
@@ -89,6 +104,8 @@ class AsyncLocalStorage final: public jsg::Object {
     JSG_STATIC_METHOD(bind);
     JSG_STATIC_METHOD(snapshot);
     JSG_READONLY_PROTOTYPE_PROPERTY(name, getName);
+    registry.registerExternalReference(&boundFunctionCallback);
+    registry.registerExternalReference(&snapshotFunctionCallback);
 
     JSG_TS_OVERRIDE(AsyncLocalStorage<T> {
       constructor(options?: AsyncLocalStorageAsyncLocalStorageOptions);
@@ -246,6 +263,7 @@ class AsyncResource final: public jsg::Object {
     JSG_METHOD(bind);
     JSG_METHOD(runInAsyncScope);
     JSG_METHOD(emitDestroy);
+    registry.registerExternalReference(&boundFunctionCallback);
 
     JSG_TS_OVERRIDE(AsyncResource {
       constructor(type: string, options?: AsyncResourceOptions);
