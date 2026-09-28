@@ -1751,6 +1751,11 @@ struct JsSetup {
   template <const char* name>
   inline void registerInheritIntrinsic(v8::Intrinsic intrinsic) {}
 
+  inline void registerExternalReference(intptr_t addr) {}
+
+  template <typename T>
+  inline void registerExternalReference(T* fnPtr) {}
+
   template <typename Method, Method method>
   inline void registerCallable() {}
 

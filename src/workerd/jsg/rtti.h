@@ -622,6 +622,11 @@ struct MemberCounter {
   template <const char* name>
   inline void registerInheritIntrinsic(v8::Intrinsic intrinsic) { /* inherit is not a member */ }
 
+  inline void registerExternalReference(intptr_t addr) { /* not a member */ }
+
+  template <typename T>
+  inline void registerExternalReference(T* fnPtr) { /* not a member */ }
+
   template <const char* name, typename Method, Method method>
   inline void registerIterable() { /* not a member */ }
 
@@ -738,6 +743,11 @@ struct MembersBuilder {
   inline void registerInheritIntrinsic(v8::Intrinsic intrinsic) {
     structure.initExtends().initIntrinsic().setName(name);
   }
+
+  inline void registerExternalReference(intptr_t addr) { /* not a member */ }
+
+  template <typename T>
+  inline void registerExternalReference(T* fnPtr) { /* not a member */ }
 
   template <typename Type, const char* name>
   inline void registerNestedType() {
