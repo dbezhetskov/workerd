@@ -124,7 +124,17 @@ v8::Local<v8::Object> AsyncContextFrame::getJSWrapper(Lock& js) {
 }
 
 void AsyncContextFrame::jsgVisitForGc(GcVisitor& visitor) {
-  // tracing will make the members weak and will allow
-  // them to be gc'd, which is not what we want.
+  if (visitor.isSnapshotReset()) {
+    // PREPARE_SNAPSHOT member-handle drain: pin and drop the stored values so CreateBlob's
+    // global-handle check passes. The frame itself is not snapshot-clonable, so a frame that is
+    // still reachable from the snapshot is rejected by name by the strict serializer gate; the
+    // drop only keeps that rejection from being pre-empted by a handle-leak abort.
+    for (auto& entry: storage) {
+      visitor.visit(entry.value);
+    }
+    return;
+  }
+  // Regular GC tracing would make the members weak and allow them to be collected, which is not
+  // what we want: the stored values must live exactly as long as the frame.
 }
 }  // namespace workerd::jsg
